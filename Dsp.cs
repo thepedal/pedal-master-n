@@ -96,6 +96,10 @@ namespace PedalMasterN
 
         public void Reset() { ic1L = ic1R = ic2L = ic2R = 0.0; }
 
+        // True while the design is exactly unity (output = input, bit for bit) and
+        // not ramping: a flat shelf or a 0 dB bell. Such a filter can be skipped.
+        public bool IsUnity => left == 0 && c3 == 1.0 && c4 == 0.0 && c5 == 0.0;
+
         void Core(double g, double k, double m0, double m1, double m2)
         {
             double a1 = 1.0 / (1.0 + g * (g + k));
@@ -178,6 +182,47 @@ namespace PedalMasterN
         public void Run2(ref double l, ref double r) { Step(); l = TickL(l); r = TickR(r); } // stereo pair
     }
 
+    // ── First-order tilt (trapezoidal one-pole, per-sample coefficient ramps) ──
+    // Same response as the bilinear design H(s) = (A·s + w0) / (s + A·w0) prewarped
+    // at f0 (gain 1/A below, A above, exactly 0 dB at f0), written as
+    // A·HP + LP/A around a zero-delay one-pole at A·w0. Unlike a direct-form
+    // biquad it stays smooth while the tilt moves.
+    internal sealed class Tilt1
+    {
+        double G, mH = 1, mL = 1;                          // current
+        double tG, tH = 1, tL = 1, dG, dH, dL;             // target and per-sample step
+        int left;
+        double sL, sR;
+
+        public void Reset() { sL = sR = 0.0; }
+
+        public void Design(double fs, double f0, double db)
+        {
+            double A = Math.Pow(10.0, db / 40.0);
+            double g = A * Math.Tan(Math.PI * f0 / fs);    // the pole A·w0, prewarped as the biquad was
+            tG = g / (1.0 + g); tH = A; tL = 1.0 / A;
+        }
+
+        public void Apply(int n)
+        {
+            if (n <= 0) { G = tG; mH = tH; mL = tL; left = 0; return; }
+            dG = (tG - G) / n; dH = (tH - mH) / n; dL = (tL - mL) / n;
+            left = n;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void Run2(ref double l, ref double r)
+        {
+            if (left > 0)
+            {
+                if (--left == 0) { G = tG; mH = tH; mL = tL; }
+                else { G += dG; mH += dH; mL += dL; }
+            }
+            double v = (l - sL) * G, lp = v + sL; sL = lp + v; l = mH * (l - lp) + mL * lp;
+            v = (r - sR) * G; lp = v + sR; sR = lp + v; r = mH * (r - lp) + mL * lp;
+        }
+    }
+
     // ── Interpolated peak search (limiter detector and true-peak meter) ───────
     // Each channel keeps a mirrored history: every sample is written twice, T
     // apart, so the last T samples are always contiguous (oldest first). The
@@ -215,6 +260,14 @@ namespace PedalMasterN
 
         public static readonly float[] TpRev  = new float[TP_PHASES * TP_TAPS];    // reversed, row-major [phase][tap]
         public static readonly float[] DetRev = new float[DET_PHASES * DET_TAPS];
+
+        // Transposed for the all-phases-at-once evaluation: [tap][phase], reversed taps,
+        // phase 0 replaced by an exact unit tap on the sample it falls on.
+        public static readonly float[] TpT  = new float[TP_TAPS * TP_PHASES];
+        public static readonly float[] DetT = new float[DET_TAPS * DET_PHASES];
+        // Largest Σ|coefficient| over the phases (with a rounding margin): the
+        // interpolated peak can never exceed this times the window's largest sample.
+        public static readonly float TpBound, DetBound;
 
         static Interp()
         {
@@ -257,6 +310,97 @@ namespace PedalMasterN
                 for (int k = 0; k < TP_TAPS; k++) TpRev[ph * TP_TAPS + k] = tp[ph, TP_TAPS - 1 - k];
             for (int ph = 0; ph < DET_PHASES; ph++)
                 for (int k = 0; k < DET_TAPS; k++) DetRev[ph * DET_TAPS + k] = det[ph, DET_TAPS - 1 - k];
+
+            TpBound  = Transpose(TpRev,  TpT,  TP_TAPS,  TP_PHASES,  TP_TAPS / 2);
+            DetBound = Transpose(DetRev, DetT, DET_TAPS, DET_PHASES, DET_HALF);
+        }
+
+        static float Transpose(float[] rev, float[] tr, int taps, int phases, int H)
+        {
+            double bound = 1.0;
+            for (int ph = 0; ph < phases; ph++)
+            {
+                double sum = 0;
+                for (int k = 0; k < taps; k++)
+                {
+                    float c = ph == 0 ? (k == taps - 1 - H ? 1.0f : 0.0f) : rev[ph * taps + k];
+                    tr[k * phases + ph] = c;
+                    sum += Math.Abs(c);
+                }
+                if (sum > bound) bound = sum;
+            }
+            return (float)(bound * 1.0001);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        static float HMax(Vector128<float> m)
+        {
+            m = Vector128.Max(m, Vector128.Shuffle(m, Vector128.Create(2, 3, 0, 1)));
+            m = Vector128.Max(m, Vector128.Shuffle(m, Vector128.Create(1, 0, 3, 2)));
+            return m.ToScalar();
+        }
+
+        // Largest |sample| in a window of `taps` floats (taps a multiple of 4).
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static float MaxAbs(float[] a, int off, int taps)
+        {
+            ref float p = ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(a), off);
+            Vector128<float> m = Vector128.Abs(Vector128.LoadUnsafe(ref p));
+            for (int k = 4; k < taps; k += 4) m = Vector128.Max(m, Vector128.Abs(Vector128.LoadUnsafe(ref p, (nuint)k)));
+            return HMax(m);
+        }
+
+        // Limiter detector: the peak over all 8 phases of both channels' windows.
+        // One broadcast multiply-add per tap evaluates all 8 phases at once.
+        public static void DetPeak(float[] l, float[] r, int off, out float pkL, out float pkR)
+        {
+            ref float wl = ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(l), off);
+            ref float wr = ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(r), off);
+            ref float t = ref MemoryMarshal.GetArrayDataReference(DetT);
+            if (Vector256.IsHardwareAccelerated)
+            {
+                Vector256<float> aL0 = Vector256<float>.Zero, aL1 = aL0, aR0 = aL0, aR1 = aL0;
+                for (int k = 0; k < DET_TAPS; k += 2)
+                {
+                    var c0 = Vector256.LoadUnsafe(ref t, (nuint)(k * 8));
+                    var c1 = Vector256.LoadUnsafe(ref t, (nuint)(k * 8 + 8));
+                    aL0 += Vector256.Create(Unsafe.Add(ref wl, k)) * c0;
+                    aR0 += Vector256.Create(Unsafe.Add(ref wr, k)) * c0;
+                    aL1 += Vector256.Create(Unsafe.Add(ref wl, k + 1)) * c1;
+                    aR1 += Vector256.Create(Unsafe.Add(ref wr, k + 1)) * c1;
+                }
+                var mL = Vector256.Abs(aL0 + aL1); var mR = Vector256.Abs(aR0 + aR1);
+                pkL = HMax(Vector128.Max(mL.GetLower(), mL.GetUpper()));
+                pkR = HMax(Vector128.Max(mR.GetLower(), mR.GetUpper()));
+            }
+            else
+            {
+                Vector128<float> l0 = Vector128<float>.Zero, l1 = l0, r0 = l0, r1 = l0;
+                for (int k = 0; k < DET_TAPS; k++)
+                {
+                    var c0 = Vector128.LoadUnsafe(ref t, (nuint)(k * 8));
+                    var c1 = Vector128.LoadUnsafe(ref t, (nuint)(k * 8 + 4));
+                    var xl = Vector128.Create(Unsafe.Add(ref wl, k)); var xr = Vector128.Create(Unsafe.Add(ref wr, k));
+                    l0 += xl * c0; l1 += xl * c1; r0 += xr * c0; r1 += xr * c1;
+                }
+                pkL = HMax(Vector128.Max(Vector128.Abs(l0), Vector128.Abs(l1)));
+                pkR = HMax(Vector128.Max(Vector128.Abs(r0), Vector128.Abs(r1)));
+            }
+        }
+
+        // True-peak meter: the peak over the 4 phases of one channel's window.
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static float TpPeak(float[] h, int off)
+        {
+            ref float w = ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(h), off);
+            ref float t = ref MemoryMarshal.GetArrayDataReference(TpT);
+            Vector128<float> a0 = Vector128<float>.Zero, a1 = a0;
+            for (int k = 0; k < TP_TAPS; k += 2)
+            {
+                a0 += Vector128.Create(Unsafe.Add(ref w, k)) * Vector128.LoadUnsafe(ref t, (nuint)(k * 4));
+                a1 += Vector128.Create(Unsafe.Add(ref w, k + 1)) * Vector128.LoadUnsafe(ref t, (nuint)(k * 4 + 4));
+            }
+            return HMax(Vector128.Abs(a0 + a1));
         }
 
         static double BesselI0(double x)

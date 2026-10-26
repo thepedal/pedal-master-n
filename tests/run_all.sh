@@ -11,7 +11,7 @@ cd "$(dirname "$0")"
 dotnet build harness-src/Harness.csproj -c Release -o build/harness >/dev/null
 dotnet build loudness-src/LoudnessTest.csproj -c Release -o build/lt >/dev/null
 cp build/harness/* .
-for t in t1 t2 t3 t4 t5 t5b t6 t7 t8 t10 t12; do echo "── $t"; python3 $t.py; done
+for t in t1 t2 t3 t4 t5 t5b t6 t7 t8 t8b t10 t12; do echo "── $t"; python3 $t.py; done
 echo "── t9 (GUI loudness maths)"; python3 t9_loudness.py build/lt/lt
 echo "── sleep on silent input"; python3 sleep_check.py ./harness
 if [ -n "$1" ]; then echo "── against the native C++ build"; python3 equivalence.py "$1" ./harness; fi

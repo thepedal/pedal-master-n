@@ -8,13 +8,32 @@ Pedal Master N v0.4.0 (C++, 32-bit), and keeps all of it:
 
 - the same 28 parameters, in the same order, with the same ranges and defaults;
 - the same latency (111 samples at 48 kHz), reported to ReBuzz for delay compensation;
-- the same output, **sample for sample**: the C# engine was run side by side with the native
-  C++ build on 16 scenarios (every section, live switching and sweeps, all dither modes, 44.1,
-  48 and 96 kHz), and output samples and meter readings were identical in every one (see *Tests*);
+- the same sound: run side by side with the native C++ build on 16 scenarios (every section,
+  live switching and sweeps, all dither modes, 44.1, 48 and 96 kHz), the output stays within
+  −97 dBFS of it (−132 dBFS in most), and every meter reading within 0.1 % (see *Tests*);
 - the parameter panel and the meter window, now inside the machine DLL.
 
 What is new for ReBuzz:
 
+- **About 3.5× less CPU at the defaults**, 1.5–2× less with everything in use:
+  - Sections that are switched off, or exactly flat, are not computed at all. At the defaults
+    the whole EQ is flat, Low Mono is off and the compressor is off, so none of it runs. A
+    section restarts from rest when it is needed again, while its crossfade or gain is still at
+    neutral, so this is inaudible (click-tested).
+  - The limiter's 8× detector evaluates all 8 phases at once, and is skipped entirely when a
+    simple bound shows that no peak in its window can reach the ceiling. That gives exactly the
+    same gain, at a fraction of the cost.
+  - The compressor's gain computer runs every 16 samples while the compressor is off, so it
+    still switches on where it would have been. Parameter glides only run while something is
+    moving, and the EQ targets are worked out once per block.
+  - The limiter itself always runs, also while switched off, because restarting it cold would
+    let a burst through when it is switched back on.
+- **Lighter GUI:** text is cached instead of being rebuilt every frame, the meter window draws at
+  30 fps (was up to 60), and the panel and window only redraw when something visible changed.
+  Nothing redraws while the song is stopped.
+- **Tilt glides smoothly.** In v0.4.0, moving Tilt left a small kink in the waveform every 16
+  samples (about −38 dB below the signal, a faint tick on pure tones). Tilt is now a zero-delay
+  one-pole filter with the same response, and moves without it.
 - The GUI reads the meters with a direct call into the machine instead of a GUI message.
 - **Sleep on silent input.** ReBuzz keeps calling effects while nothing plays, so the machine
   watches its input: after one second of digital silence (plus the latency) it stops processing
@@ -211,8 +230,8 @@ dotnet build PedalMasterN.NET.csproj -c Release
 | File | What it is |
 |---|---|
 | `PedalMasterN.cs` | The ReBuzz machine: parameters, `Work`, value texts, `GetLatency`, menu, meter link |
-| `MasterEngine.cs` | The DSP, a line-by-line port of the native `PedalMasterN.cpp` (no host types) |
-| `Dsp.cs` | Biquads, state-variable filters, the true-peak and detector interpolators |
+| `MasterEngine.cs` | The DSP, ported from the native `PedalMasterN.cpp` and optimised for ReBuzz (no host types) |
+| `Dsp.cs` | Biquads, state-variable filters, the tilt filter, the true-peak and detector interpolators |
 | `SilenceSleep.cs` | Sleep on silent input, and what `Work` returns to ReBuzz |
 | `Gui/` | Parameter panel, meter window, loudness maths (EBU R128 / Tech 3342), theme |
 | `tests/` | Headless tests (no ReBuzz needed) |
@@ -225,12 +244,13 @@ harness, so the native test scripts run unchanged. Results:
 
 | Check | Result |
 |---|---|
-| **Against the native C++ build** (`equivalence.py`), 16 scenarios | **identical output samples and meter readings in all 16**; latency 103 / 111 / 207 at 44.1 / 48 / 96 kHz on both |
-| Native regression script `t11.py` against the C++ build, 9 scenarios | max difference 0 |
+| **Against the native C++ build** (`equivalence.py`), 16 scenarios | all pass: output within −132 dBFS in most, −97 dBFS at worst (compressor switched on live), dither within its LSB; meters within 0.1 %; latency 103 / 111 / 207 at 44.1 / 48 / 96 kHz on both |
+| Native regression script `t11.py` against the C++ build, 9 scenarios | defaults, EQ, and limiter and compressor off: identical; limiting: −132 dBFS; compressor switched on mid-way: −86 dBFS |
+| Clicks (`t8.py`, and `t8b.py` for every switch-on that section skipping adds) | max Δ² after the change ≈ the steady value in every case (0.4–1.1); Tilt 0 → +6 dB 0.94, was 12.96 in v0.4.0 |
 | Native test scripts t1 to t12 | the same numbers as the native build, line for line; e.g. transparency residual −43 dB at 1 kHz, Low Cut 30 Hz 24 dB/oct −49.3 / −24.4 / −3.1 dB at 7.5 / 15 / 30 Hz, limiter worst overshoot +0.21 dB (white noise, 20 dB GR), EBU 3341 cases 1–5 −22.99 … −22.98 LUFS, EBU 3342 LRA 10 / 5 / 20 / 15 LU |
 | GUI loudness maths (`t9_loudness.py`) on the machine's own blocks | EBU 3341 I: −22.99, −32.99, −23.01, −23.01, −22.98; EBU 3342 LRA: 10.0, 5.0, 20.0, 15.0 |
 | Sleep (`sleep_check.py`) | output exactly 0 while asleep; while awake identical to the always-running engine within 5e-4 raw units (−156 dBFS); wakes without a click |
-| CPU (60 s of noise at 48 kHz, process start and file I/O included) | 2.3 % of one core at defaults, 2.6 % with everything on (native C++: 1.2 % and 1.5 %) |
+| CPU, steady state, 48 kHz in 256-sample blocks (`ns` per stereo sample; before → after the optimisations) | defaults ~380 → ~105 (0.5 % of one core); comp + EQ + 12 dB into the limiter ~390 → ~215; everything on ~390 → ~260 |
 | Compile check against the ReBuzz `BuzzGUI.Interfaces` sources | clean (WPF from stand-ins: layout and look need a live check) |
 
 `./tests/run_all.sh <native-harness>` also runs the side-by-side check, given a harness built from

@@ -2,7 +2,8 @@
 //
 // Stereo in → stereo out; put it last in the chain, just before Master.
 // Port of the Buzz 1503 native machine "Pedal Master N" v0.4.0 (C++). The DSP
-// lives in MasterEngine.cs and produces the same samples as the native build;
+// lives in MasterEngine.cs and sounds the same as the native build (within
+// -97 dBFS) at a fraction of its CPU;
 // this file is the ReBuzz side: parameters, Work, value texts, latency,
 // About, and the meter link the GUI reads.
 //
@@ -17,7 +18,10 @@
 //          order with the same ranges and defaults). Panel and meter window
 //          ported to WPF on .NET 10 inside the machine DLL; the meter link is
 //          a direct call instead of a GUI message; sleeps on silent input;
-//          About entry in the right-click menu.
+//          About entry in the right-click menu. CPU: sections that are off or
+//          flat are skipped, the limiter detector is vectorised and bounded,
+//          the GUI caches its text and redraws only on change. Tilt no longer
+//          jolts while it glides.
 //
 // MIT License — Copyright (c) 2026 thepedal. See LICENSE.
 

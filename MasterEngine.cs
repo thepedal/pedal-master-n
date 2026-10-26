@@ -1,7 +1,7 @@
 // Pedal Master N — the mastering engine (pure C#, no host types).
 //
-// A line-by-line port of the Buzz 1503 native machine's DSP (PedalMasterN.cpp
-// v0.4.0): same parameters, same arithmetic, same latency. The ReBuzz machine
+// A port of the Buzz 1503 native machine's DSP (PedalMasterN.cpp v0.4.0): same
+// parameters, same arithmetic, same latency, optimised for ReBuzz. The ReBuzz machine
 // class (PedalMasterN.cs) only adapts the host's Sample[] buffers and
 // parameter setters to this class; the test harness drives it directly.
 //
@@ -13,7 +13,16 @@
 //      → True-peak limiter (Gain, Ceiling in dBTP, Release, 2 ms look-ahead)
 //      → [master meters] → Match / Bypass → Dither → Out
 //
-// Differences from the native machine, all below audibility:
+// Differences from the native machine, all below audibility (tests/equivalence.py:
+// within -97 dBFS of it, -132 dBFS in most cases):
+//   - sections that are off or exactly flat are skipped and restart from rest
+//     when needed again (see "Section skipping");
+//   - the limiter detector evaluates all 8 phases at once (different rounding in
+//     the last bit) and is skipped when a bound shows no peak can reach the
+//     ceiling (same attenuation);
+//   - while the compressor is off its envelopes are tracked every EQ_STEP samples;
+//   - Tilt is a trapezoidal one-pole with coefficient ramps (same response; the
+//     native biquad jolted a little while gliding);
 //   - no MXCSR flush-to-zero (the host owns the thread); the two float
 //     envelopes that can decay into the denormal range are flushed explicitly
 //     (Core §30);
@@ -149,7 +158,7 @@ namespace PedalMasterN
         readonly Svf lowCut = new Svf(), lowCut24a = new Svf(), lowCut24b = new Svf();
         readonly Svf lowShelf = new Svf(), highShelf = new Svf(), lowDip = new Svf();
         readonly Svf dcBlock = new Svf();                     // 5 Hz, always on
-        readonly Biquad tilt = new Biquad();                  // first order, fixed 1 kHz pivot
+        readonly Tilt1 tilt = new Tilt1();                    // first order, fixed 1 kHz pivot
         readonly Svf lmLp1 = new Svf(), lmLp2 = new Svf(), lmHp1 = new Svf(), lmHp2 = new Svf(),
                      lmSHp1 = new Svf(), lmSHp2 = new Svf(); // Low Mono LR4 crossover
         readonly Svf[] lmAll;
@@ -175,7 +184,6 @@ namespace PedalMasterN
         readonly float[] dLimL = new float[RING], dLimR = new float[RING];
         readonly float[] dRawL = new float[RING], dRawR = new float[RING];
         int dw;
-        float limRelK;
 
         // Output metering.
         readonly Mirror mh = new Mirror(Interp.TP_TAPS);      // output true-peak meter history
@@ -239,6 +247,7 @@ namespace PedalMasterN
             if (rate <= 0) rate = 44100;
             sr = rate;
             kGlide = 1.0f - MathF.Exp(-1.0f / (SMOOTH_SECONDS * sr));
+            kEq = 1.0 - Math.Exp(-(double)EQ_STEP / (SMOOTH_SECONDS * sr));
 
             look = (int)(LOOKAHEAD_S * sr + 0.5);
             if (look < 1) look = 1;
@@ -262,6 +271,7 @@ namespace PedalMasterN
             lowDip.Reset();
             foreach (var f in lmAll) f.Reset();
             scHpf.Reset(); scHpfSel = -1;
+            lc12Live = lc24Live = lsLive = dipLive = hsLive = tiltLive = lmLive = false;
             first = true;
         }
 
@@ -271,26 +281,45 @@ namespace PedalMasterN
         public void Wake() { first = true; }
 
         // ── Block-rate glide of the filter design values ──────────────────────
-        void UpdateEq(int n, bool snap)
+        // Targets are computed once per block (CacheEqTargets); the glide itself
+        // runs every EQ_STEP samples and returns at once when everything is settled.
+        double tLcHz, tLsHz, tLsDb, tHsHz, tHsDb, tTilt, tLsK, tDip, tLmHz;
+        bool tLcOn, tLmOn;
+        double kEq;                                   // glide coefficient per EQ_STEP, per sample rate
+
+        void CacheEqTargets()
         {
-            double k = snap ? 1.0 : 1.0 - Math.Exp(-(double)n / (SMOOTH_SECONDS * sr));
+            var v = V;
+            tLcOn = v[P_LOWCUT] > 0;   if (tLcOn) tLcHz = LowCutHz(v[P_LOWCUT]);
+            tLsHz = LowShelfHz(v[P_LOWFREQ]);
+            tLsDb = ShelfDb(v[P_LOWGAIN]);
+            tHsHz = HighShelfHz(v[P_HIGHFREQ]);
+            tHsDb = ShelfDb(v[P_HIGHGAIN]);
+            tTilt = TiltDb(v[P_TILT]);
+            tLsK  = v[P_LOWSHAPE] != 0 ? SHELF_K_VINTAGE : SHELF_K_CLEAN;
+            tDip  = -DipDb(v[P_LOWDIP]);
+            tLmOn = v[P_LOWMONO] > 0;  if (tLmOn) tLmHz = LowMonoHz(v[P_LOWMONO]);
+        }
+
+        void UpdateEq(int n, bool snap, float lcMixNow, float lmMixNow)
+        {
+            double k = snap ? 1.0 : kEq;
 
             // A frequency whose section is fully faded out jumps straight to its target,
             // so switching the section on never sweeps the filter through the audio.
             bool dirty = snap;
-            if (V[P_LOWCUT] > 0)
+            if (tLcOn)
             {
-                double t = LowCutHz(V[P_LOWCUT]);
-                if (lcMix == 0.0f && lcHz != t) { lcHz = t; dirty = true; }
-                else if (GlideLog(ref lcHz, t, k)) dirty = true;
+                if (lcMixNow == 0.0f && lcHz != tLcHz) { lcHz = tLcHz; dirty = true; }
+                else if (GlideLog(ref lcHz, tLcHz, k)) dirty = true;
             }
-            dirty |= GlideLog(ref lsHz, LowShelfHz(V[P_LOWFREQ]), k);
-            dirty |= GlideLin(ref lsDb, ShelfDb(V[P_LOWGAIN]), k);
-            dirty |= GlideLog(ref hsHz, HighShelfHz(V[P_HIGHFREQ]), k);
-            dirty |= GlideLin(ref hsDb, ShelfDb(V[P_HIGHGAIN]), k);
-            dirty |= GlideLin(ref tiltDb, TiltDb(V[P_TILT]), k);
-            dirty |= GlideLin(ref lsK, V[P_LOWSHAPE] != 0 ? SHELF_K_VINTAGE : SHELF_K_CLEAN, k);   // Clean ↔ Vintage morphs
-            dirty |= GlideLin(ref dipDb, -DipDb(V[P_LOWDIP]), k);
+            dirty |= GlideLog(ref lsHz, tLsHz, k);
+            dirty |= GlideLin(ref lsDb, tLsDb, k);
+            dirty |= GlideLog(ref hsHz, tHsHz, k);
+            dirty |= GlideLin(ref hsDb, tHsDb, k);
+            dirty |= GlideLin(ref tiltDb, tTilt, k);
+            dirty |= GlideLin(ref lsK, tLsK, k);               // Clean ↔ Vintage morphs
+            dirty |= GlideLin(ref dipDb, tDip, k);
             int ramp = snap ? 0 : n;               // coefficients move linearly across the step
             if (dirty)
             {
@@ -303,15 +332,14 @@ namespace PedalMasterN
                 double fd = DIP_RATIO * lsHz;
                 lowDip.Bell(sr, fd < fmax ? fd : fmax, dipDb, DIP_Q);           lowDip.Apply(ramp);
                 highShelf.HighShelf(sr, hsHz < fmax ? hsHz : fmax, hsDb);       highShelf.Apply(ramp);
-                tilt.Tilt(sr, 1000.0, tiltDb);
+                tilt.Design(sr, 1000.0, tiltDb);             tilt.Apply(ramp);
             }
 
             bool lmDirty = snap;
-            if (V[P_LOWMONO] > 0)
+            if (tLmOn)
             {
-                double t = LowMonoHz(V[P_LOWMONO]);
-                if (lmMix == 0.0f && lmHz != t) { lmHz = t; lmDirty = true; }
-                else if (GlideLog(ref lmHz, t, k)) lmDirty = true;
+                if (lmMixNow == 0.0f && lmHz != tLmHz) { lmHz = tLmHz; lmDirty = true; }
+                else if (GlideLog(ref lmHz, tLmHz, k)) lmDirty = true;
             }
             if (lmDirty)
             {
@@ -355,6 +383,20 @@ namespace PedalMasterN
             return MathF.Abs(tgt - cur) < 1e-4f ? tgt : cur;
         }
 
+        // ── Section skipping ──────────────────────────────────────────────────
+        // A section that is switched off (fully faded out) or exactly flat is not
+        // computed at all. Its filter state is then stale, so it restarts from rest
+        // the moment it is needed again; that happens only while its crossfade or
+        // its gain is still at (or within a hair of) neutral, so it is inaudible.
+        bool lc12Live, lc24Live, lsLive, dipLive, hsLive, tiltLive, lmLive;
+
+        static bool Engage(bool run, ref bool live, Svf a, Svf b = null)
+        {
+            if (run && !live) { a.Reset(); b?.Reset(); }
+            live = run;
+            return run;
+        }
+
         // ── Work ──────────────────────────────────────────────────────────────
         // io: interleaved L,R (±32768), n frames, processed in place.
         // read = false treats the input as silence (no WM_READ).
@@ -376,6 +418,15 @@ namespace PedalMasterN
         }
 
         int Clamp(int v, int max) => v < 0 ? 0 : v > max ? max : v;
+
+        static float StaticGr(double det, float thr, float slope, float knee)
+        {
+            float db = det > 1e-12 ? 10.0f * (float)Math.Log10(det) : -120.0f;
+            float over = db - thr;
+            if (2 * over < -knee) return 0.0f;
+            if (2 * over > knee) return over * slope;
+            float t = over + knee / 2; return slope * t * t / (2 * knee);
+        }
 
         void Process(Span<float> ps, int n)
         {
@@ -405,14 +456,24 @@ namespace PedalMasterN
             float qStep  = dither == 1 ? 1.0f / 256.0f : 1.0f;         // ±32768 units: 1.0 = one 16-bit LSB
             float qInv   = 1.0f / qStep;
 
+            CacheEqTargets();
             bool snapEq = first;
             if (first)
             {
-                gIn = tIn; eqMix = tEq; lcMix = tLc; compOn = tComp; makeup = tMakeup; mix = tMix;
-                lmMix = tLm; width = tWidth; limOn = tLim; limGain = tLimG; ceilLin = tCeil; bypass = tByp;
-                slopeMix = tSlope; gMaster = tGM; gDry = tGD;
+                this.gIn = tIn; this.eqMix = tEq; this.lcMix = tLc; this.compOn = tComp; this.makeup = tMakeup; this.mix = tMix;
+                this.lmMix = tLm; this.width = tWidth; this.limOn = tLim; this.limGain = tLimG; this.ceilLin = tCeil; this.bypass = tByp;
+                this.slopeMix = tSlope; this.gMaster = tGM; this.gDry = tGD;
                 first = false;
             }
+
+            // Hot state into locals (the JIT keeps them in registers), written back below.
+            float gIn = this.gIn, eqMix = this.eqMix, lcMix = this.lcMix, compOn = this.compOn, makeup = this.makeup,
+                  mix = this.mix, lmMix = this.lmMix, width = this.width, limOn = this.limOn, limGain = this.limGain,
+                  ceilLin = this.ceilLin, bypass = this.bypass, slopeMix = this.slopeMix, gMaster = this.gMaster, gDry = this.gDry;
+            // Glides run per sample only while something is still moving.
+            bool gliding = gIn != tIn || eqMix != tEq || lcMix != tLc || compOn != tComp || makeup != tMakeup || mix != tMix
+                        || lmMix != tLm || width != tWidth || limOn != tLim || limGain != tLimG || ceilLin != tCeil
+                        || bypass != tByp || slopeMix != tSlope || gMaster != tGM || gDry != tGD;
 
             // Compressor constants.
             float thr   = ThreshDb(v[P_THRESH]);
@@ -428,11 +489,27 @@ namespace PedalMasterN
             float aSlowAtt = 1.0f - MathF.Exp(-1.0f / (0.8f * sr));
             float aSlowRel = 1.0f - MathF.Exp(-1.0f / (0.4f * sr));
             bool  useSc = v[P_SCHPF] > 0;
+            // The same envelope coefficients for one update per EQ_STEP samples.
+            float aAttS = 1.0f - MathF.Pow(1.0f - aAtt, EQ_STEP), aRelS = 1.0f - MathF.Pow(1.0f - aRel, EQ_STEP);
+            float aSlowAttS = autoRel ? 1.0f - MathF.Pow(1.0f - aSlowAtt, EQ_STEP) : 0.0f;
+            float aSlowRelS = autoRel ? 1.0f - MathF.Pow(1.0f - aSlowRel, EQ_STEP) : 1.0f;
             double aDet = 1.0 - Math.Exp(-1.0 / (0.005 * sr));
 
-            limRelK = 1.0f - MathF.Exp(-1.0f / ((float)LimRelMs(v[P_LIMREL]) * 0.001f * sr));
+            float limRelK = 1.0f - MathF.Exp(-1.0f / ((float)LimRelMs(v[P_LIMREL]) * 0.001f * sr));
+            int   look = this.look;
             float invLook = 1.0f / look;
             int   D = look - 1 + TP_DELAY + 1;              // output delay, = latency
+
+            double detMs = this.detMs; float grFast = this.grFast, grSlow = this.grSlow;
+            float prevPk = this.prevPk, relState = this.relState;
+            int dqHead = this.dqHead, dqTail = this.dqTail, boxPos = this.boxPos, sampleIdx = this.sampleIdx, dw = this.dw;
+            double boxSum = this.boxSum;
+            int blockFill = this.blockFill, blockLen = this.blockLen;
+            double blockSum = this.blockSum, inBlockSum = this.inBlockSum;
+            float[] box = this.box, dqVal = this.dqVal; int[] dqIdx = this.dqIdx;
+            float[] dPreL = this.dPreL, dPreR = this.dPreR, dLimL = this.dLimL, dLimR = this.dLimR, dRawL = this.dRawL, dRawR = this.dRawR;
+            Mirror hist = this.hist, mh = this.mh;
+            float detBound = Interp.DetBound, tpBound = Interp.TpBound;
 
             float k = kGlide;
             float inPkL = 0, inPkR = 0, outTpL = 0, outTpR = 0;
@@ -443,13 +520,45 @@ namespace PedalMasterN
             double cLL = 0, cLR = 0, cRR = 0;
             const double invFs = 1.0 / FULL_SCALE;
             const int RM = RING - 1;
-            float[] detRev = Interp.DetRev, tpRev = Interp.TpRev;
+
+            bool eqRun = false, lc12 = false, lc24 = false, ls = false, dip = false, hs = false, tl = false, lm = false;
+            bool compRun = false;
 
             for (int s = 0; s < n; s++)
             {
                 // Filter designs glide in steps of EQ_STEP samples: small enough that a
-                // live frequency sweep doesn't jolt the filters.
-                if ((s % EQ_STEP) == 0) UpdateEq(EQ_STEP, snapEq && s == 0);
+                // live frequency sweep doesn't jolt the filters. Which sections run is
+                // decided at the same points.
+                if ((s % EQ_STEP) == 0)
+                {
+                    UpdateEq(EQ_STEP, snapEq && s == 0, lcMix, lmMix);
+                    eqRun = !(eqMix == 0.0f && tEq == 0.0f);
+                    bool lcRun = eqRun && !(lcMix == 0.0f && tLc == 0.0f);
+                    // Both slopes run while the low cut is on, so switching Slope never
+                    // starts a high-pass from rest under the bass.
+                    lc12 = Engage(lcRun, ref lc12Live, lowCut);
+                    lc24 = Engage(lcRun, ref lc24Live, lowCut24a, lowCut24b);
+                    ls   = Engage(eqRun && !lowShelf.IsUnity,  ref lsLive,  lowShelf);
+                    dip  = Engage(eqRun && !lowDip.IsUnity,    ref dipLive, lowDip);
+                    hs   = Engage(eqRun && !highShelf.IsUnity, ref hsLive,  highShelf);
+                    bool tRun = eqRun && tiltDb != 0.0;
+                    if (tRun && !tiltLive) tilt.Reset();
+                    tiltLive = tl = tRun;
+                    lm = !(lmMix == 0.0f && tLm == 0.0f);
+                    if (lm && !lmLive) foreach (var f in lmAll) f.Reset();
+                    lmLive = lm;
+                    compRun = !(compOn == 0.0f && tComp == 0.0f);
+                    if (!compRun)
+                    {
+                        // Compressor off: keep its envelopes on track at 1/EQ_STEP of the
+                        // rate, so switching it on lands where it would have been.
+                        float gr = StaticGr(detMs, thr, slope, knee);
+                        grFast += (gr - grFast) * (gr > grFast ? aAttS : aRelS);
+                        if (grFast < 1e-20f) grFast = 0.0f;
+                        grSlow += (gr - grSlow) * (gr > grSlow ? aSlowAttS : aSlowRelS);
+                        if (grSlow < 1e-20f) grSlow = 0.0f;
+                    }
+                }
 
                 float inL = ps[2 * s], inR = ps[2 * s + 1];
 
@@ -459,12 +568,15 @@ namespace PedalMasterN
                 inSqL += (double)inL * inL;
                 inSqR += (double)inR * inR;
 
-                gIn = Glide(gIn, tIn, k);         eqMix = Glide(eqMix, tEq, k);     lcMix = Glide(lcMix, tLc, k);
-                compOn = Glide(compOn, tComp, k); makeup = Glide(makeup, tMakeup, k); mix = Glide(mix, tMix, k);
-                lmMix = Glide(lmMix, tLm, k);     width = Glide(width, tWidth, k);
-                limOn = Glide(limOn, tLim, k);    limGain = Glide(limGain, tLimG, k); ceilLin = Glide(ceilLin, tCeil, k);
-                bypass = Glide(bypass, tByp, k);  slopeMix = Glide(slopeMix, tSlope, k);
-                gMaster = Glide(gMaster, tGM, kMatch); gDry = Glide(gDry, tGD, kMatch);
+                if (gliding)
+                {
+                    gIn = Glide(gIn, tIn, k);         eqMix = Glide(eqMix, tEq, k);     lcMix = Glide(lcMix, tLc, k);
+                    compOn = Glide(compOn, tComp, k); makeup = Glide(makeup, tMakeup, k); mix = Glide(mix, tMix, k);
+                    lmMix = Glide(lmMix, tLm, k);     width = Glide(width, tWidth, k);
+                    limOn = Glide(limOn, tLim, k);    limGain = Glide(limGain, tLimG, k); ceilLin = Glide(ceilLin, tCeil, k);
+                    bypass = Glide(bypass, tByp, k);  slopeMix = Glide(slopeMix, tSlope, k);
+                    gMaster = Glide(gMaster, tGM, kMatch); gDry = Glide(gDry, tGD, kMatch);
+                }
 
                 // ── Dry loudness for Match (K-weighted, per 100 ms block) ──
                 {
@@ -477,53 +589,49 @@ namespace PedalMasterN
                 double xl = inL * gIn, xr = inR * gIn;
                 dcBlock.Run2(ref xl, ref xr);
 
-                // ── EQ ──  (filters always run, so switching never starts from stale state)
+                // ── EQ ──
+                if (eqRun)
                 {
-                    double hl = xl, hr = xr, ql = xl, qr = xr;
-                    lowCut.Run2(ref hl, ref hr);                  // 12 dB/oct
-                    lowCut24a.Run2(ref ql, ref qr);               // 24 dB/oct
-                    lowCut24b.Run2(ref ql, ref qr);
-                    hl += (ql - hl) * slopeMix;
-                    hr += (qr - hr) * slopeMix;
-                    double yl = xl + (hl - xl) * lcMix, yr = xr + (hr - xr) * lcMix;
-                    lowShelf.Run2(ref yl, ref yr);
-                    lowDip.Run2(ref yl, ref yr);                  // unity while Low Dip is Off
-                    highShelf.Run2(ref yl, ref yr);
-                    yl = tilt.Run(0, yl);
-                    yr = tilt.Run(1, yr);
+                    double yl = xl, yr = xr;
+                    if (lc12 || lc24)
+                    {
+                        double hl = xl, hr = xr, ql = xl, qr = xr;
+                        if (lc12) lowCut.Run2(ref hl, ref hr);            // 12 dB/oct
+                        if (lc24) { lowCut24a.Run2(ref ql, ref qr); lowCut24b.Run2(ref ql, ref qr); }   // 24 dB/oct
+                        if (!lc12) { hl = ql; hr = qr; }
+                        else if (lc24) { hl += (ql - hl) * slopeMix; hr += (qr - hr) * slopeMix; }
+                        yl = xl + (hl - xl) * lcMix; yr = xr + (hr - xr) * lcMix;
+                    }
+                    if (ls)  lowShelf.Run2(ref yl, ref yr);
+                    if (dip) lowDip.Run2(ref yl, ref yr);
+                    if (hs)  highShelf.Run2(ref yl, ref yr);
+                    if (tl) tilt.Run2(ref yl, ref yr);
                     xl += (yl - xl) * eqMix;
                     xr += (yr - xr) * eqMix;
                 }
 
                 // ── Glue compressor (feed-forward, log domain, stereo-linked) ──
-                // The detector always runs, so switching the compressor on lands straight
-                // on its settled gain reduction; only the gain maths is skipped while off.
+                // The RMS detector always runs; the per-sample gain computer only while
+                // the compressor is on (off, the envelopes are tracked every EQ_STEP).
                 {
                     double sl = xl, sr2 = xr;
                     if (useSc) { sl = scHpf.Run(0, xl); sr2 = scHpf.Run(1, xr); }
-                    // RMS detector (5 ms), louder side wins: steady on low frequencies
-                    // where a raw peak detector would ripple.
                     double ql = sl / FULL_SCALE, qr = sr2 / FULL_SCALE;
                     double q  = ql * ql > qr * qr ? ql * ql : qr * qr;
                     detMs += (q - detMs) * aDet;
-                    float db  = detMs > 1e-12 ? 10.0f * (float)Math.Log10(detMs) : -120.0f;
-                    float over = db - thr, gr;
-                    if (2 * over < -knee)     gr = 0.0f;
-                    else if (2 * over > knee) gr = over * slope;
-                    else { float t = over + knee / 2; gr = slope * t * t / (2 * knee); }
-
-                    grFast += (gr - grFast) * (gr > grFast ? aAtt : aRel);
-                    if (grFast < 1e-20f) grFast = 0.0f;                 // denormal guard (Core §30)
-                    float grTot = grFast;
-                    if (autoRel)
+                    if (compRun)
                     {
-                        grSlow += (gr - grSlow) * (gr > grSlow ? aSlowAtt : aSlowRel);
-                        if (grSlow < 1e-20f) grSlow = 0.0f;
-                        if (grSlow > grTot) grTot = grSlow;
-                    }
-                    if (compOn > 0.0f || tComp > 0.0f)                  // fully off = exactly unity gain
-                    {
-                        float gc  = DbToLin(-grTot);
+                        float gr = StaticGr(detMs, thr, slope, knee);
+                        grFast += (gr - grFast) * (gr > grFast ? aAtt : aRel);
+                        if (grFast < 1e-20f) grFast = 0.0f;                 // denormal guard (Core §30)
+                        float grTot = grFast;
+                        if (autoRel)
+                        {
+                            grSlow += (gr - grSlow) * (gr > grSlow ? aSlowAtt : aSlowRel);
+                            if (grSlow < 1e-20f) grSlow = 0.0f;
+                            if (grSlow > grTot) grTot = grSlow;
+                        }
+                        float gc  = grTot > 0.0f ? DbToLin(-grTot) : 1.0f;
                         float eff = makeup * (1.0f - mix + mix * gc);
                         float g   = 1.0f + (eff - 1.0f) * compOn;
                         xl *= g; xr *= g;
@@ -535,10 +643,13 @@ namespace PedalMasterN
                 // ── Stereo: Low Mono (LR4 on the side channel) and Width ──
                 {
                     double M = (xl + xr) * 0.5, S = (xl - xr) * 0.5;
-                    double mAp = lmLp2.Run1(lmLp1.Run1(M)) + lmHp2.Run1(lmHp1.Run1(M));   // LR4 sum = all-pass
-                    double sHp = lmSHp2.Run1(lmSHp1.Run1(S));
-                    M += (mAp - M) * lmMix;
-                    S += (sHp - S) * lmMix;
+                    if (lm)
+                    {
+                        double mAp = lmLp2.Run1(lmLp1.Run1(M)) + lmHp2.Run1(lmHp1.Run1(M));   // LR4 sum = all-pass
+                        double sHp = lmSHp2.Run1(lmSHp1.Run1(S));
+                        M += (mAp - M) * lmMix;
+                        S += (sHp - S) * lmMix;
+                    }
                     S *= width;
                     xl = M + S; xr = M - S;
                 }
@@ -552,31 +663,42 @@ namespace PedalMasterN
                 //   so the latency is look - 1 + H.
                 float pl = (float)xl, pr = (float)xr;
                 float gl = pl * limGain, gr2 = pr * limGain;
-                // The detector runs even while the limiter is off, so switching it on lands
-                // on a settled gain envelope instead of letting the first peaks through.
-                hist.Push(gl, gr2);
-                int wo = hist.WinOffset;
-                float ipk  = Interp.WindowPeak(hist.L, wo, detRev, Interp.DET_TAPS, Interp.DET_PHASES, Interp.DET_HALF);
-                float ipk2 = Interp.WindowPeak(hist.R, wo, detRev, Interp.DET_TAPS, Interp.DET_PHASES, Interp.DET_HALF);
-                if (ipk2 > ipk) ipk = ipk2;
-                float need = ipk > prevPk ? ipk : prevPk;
-                prevPk = ipk;
-                float att = need > ceilLin ? ceilLin / need : 1.0f;
+                // The limiter always runs, also while switched off: restarting it cold
+                // would let a burst through the moment it is switched back on.
+                float G;
+                {
+                    hist.Push(gl, gr2);
+                    int wo = hist.WinOffset;
+                    // The interpolated peak can't exceed DetBound × the window's largest
+                    // sample. Below the ceiling that bound gives exactly the same
+                    // attenuation (1) as the full 8-phase search, so the search is skipped.
+                    float bound = MathF.Max(Interp.MaxAbs(hist.L, wo, Interp.DET_TAPS), Interp.MaxAbs(hist.R, wo, Interp.DET_TAPS)) * detBound;
+                    float ipk;
+                    if (bound < ceilLin) ipk = bound;
+                    else
+                    {
+                        Interp.DetPeak(hist.L, hist.R, wo, out float ipkL, out float ipkR);
+                        ipk = ipkL > ipkR ? ipkL : ipkR;
+                    }
+                    float need = ipk > prevPk ? ipk : prevPk;
+                    prevPk = ipk;
+                    float att = need > ceilLin ? ceilLin / need : 1.0f;
 
-                int idx = sampleIdx++;
-                while (dqTail != dqHead && dqVal[(dqTail - 1) & RM] >= att) dqTail = (dqTail - 1) & RM;
-                dqVal[dqTail] = att; dqIdx[dqTail] = idx; dqTail = (dqTail + 1) & RM;
-                while (idx - dqIdx[dqHead] >= look) dqHead = (dqHead + 1) & RM;
-                float smin = dqVal[dqHead];
+                    int idx = sampleIdx++;
+                    while (dqTail != dqHead && dqVal[(dqTail - 1) & RM] >= att) dqTail = (dqTail - 1) & RM;
+                    dqVal[dqTail] = att; dqIdx[dqTail] = idx; dqTail = (dqTail + 1) & RM;
+                    while (idx - dqIdx[dqHead] >= look) dqHead = (dqHead + 1) & RM;
+                    float smin = dqVal[dqHead];
 
-                relState += (1.0f - relState) * limRelK;
-                if (smin < relState) relState = smin;
+                    relState += (1.0f - relState) * limRelK;
+                    if (smin < relState) relState = smin;
 
-                boxSum += relState - box[boxPos];
-                box[boxPos] = relState;
-                boxPos = (boxPos + 1) % look;
-                float G = (float)(boxSum * invLook);
-                if (G > 1.0f) G = 1.0f;
+                    boxSum += relState - box[boxPos];
+                    box[boxPos] = relState;
+                    if (++boxPos == look) boxPos = 0;
+                    G = (float)(boxSum * invLook);
+                    if (G > 1.0f) G = 1.0f;
+                }
 
                 dPreL[dw] = pl;  dPreR[dw] = pr;
                 dLimL[dw] = gl;  dLimR[dw] = gr2;
@@ -584,26 +706,32 @@ namespace PedalMasterN
                 int rd = (dw - D) & RM;
                 dw = (dw + 1) & RM;
 
-                float ol = dLimL[rd] * G, orr = dLimR[rd] * G;
-                if (limOn >= 1.0f)           // sample-level safety net at the ceiling
+                float ol, orr;
                 {
-                    if (ol >  ceilLin) ol =  ceilLin; else if (ol < -ceilLin) ol = -ceilLin;
-                    if (orr > ceilLin) orr = ceilLin; else if (orr < -ceilLin) orr = -ceilLin;
+                    ol = dLimL[rd] * G; orr = dLimR[rd] * G;
+                    if (limOn >= 1.0f)           // sample-level safety net at the ceiling
+                    {
+                        if (ol >  ceilLin) ol =  ceilLin; else if (ol < -ceilLin) ol = -ceilLin;
+                        if (orr > ceilLin) orr = ceilLin; else if (orr < -ceilLin) orr = -ceilLin;
+                    }
+                    float pdl = dPreL[rd], pdr = dPreR[rd];
+                    ol  = pdl + (ol  - pdl) * limOn;
+                    orr = pdr + (orr - pdr) * limOn;
+                    if (limOn > 0.0f && G < minLimG) minLimG = G;
                 }
-                float pdl = dPreL[rd], pdr = dPreR[rd];
-                ol  = pdl + (ol  - pdl) * limOn;
-                orr = pdr + (orr - pdr) * limOn;
-                if (limOn > 0.0f && G < minLimG) minLimG = G;
 
                 // ── Output metering: the master (before Bypass, Match and Dither) ──
                 outSqL += (double)ol * ol;
                 outSqR += (double)orr * orr;
                 mh.Push(ol, orr);
-                int mo = mh.WinOffset;
-                float t0 = Interp.WindowPeak(mh.L, mo, tpRev, Interp.TP_TAPS, Interp.TP_PHASES, Interp.TP_TAPS / 2);
-                float t1 = Interp.WindowPeak(mh.R, mo, tpRev, Interp.TP_TAPS, Interp.TP_PHASES, Interp.TP_TAPS / 2);
-                if (t0 > outTpL) outTpL = t0;
-                if (t1 > outTpR) outTpR = t1;
+                {
+                    // A window whose bound can't beat the block's peak so far can't change it.
+                    int mo = mh.WinOffset;
+                    if (Interp.MaxAbs(mh.L, mo, Interp.TP_TAPS) * tpBound > outTpL)
+                    { float t0 = Interp.TpPeak(mh.L, mo); if (t0 > outTpL) outTpL = t0; }
+                    if (Interp.MaxAbs(mh.R, mo, Interp.TP_TAPS) * tpBound > outTpR)
+                    { float t1 = Interp.TpPeak(mh.R, mo); if (t1 > outTpR) outTpR = t1; }
+                }
 
                 {
                     double nl = ol * invFs, nr = orr * invFs;
@@ -620,11 +748,14 @@ namespace PedalMasterN
                 }
 
                 // ── Bypass (to the delayed dry input), level-matched when Match is on ──
-                float rl = dRawL[rd] * gDry, rr = dRawR[rd] * gDry;
-                ol  *= gMaster;
-                orr *= gMaster;
-                ol  += (rl - ol)  * bypass;
-                orr += (rr - orr) * bypass;
+                if (bypass != 0.0f || gMaster != 1.0f || gDry != 1.0f)
+                {
+                    float rl = dRawL[rd] * gDry, rr = dRawR[rd] * gDry;
+                    ol  *= gMaster;
+                    orr *= gMaster;
+                    ol  += (rl - ol)  * bypass;
+                    orr += (rr - orr) * bypass;
+                }
 
                 if (MathF.Abs(ol) > 0.5f || MathF.Abs(orr) > 0.5f) anyAudible = true;
 
@@ -637,6 +768,15 @@ namespace PedalMasterN
 
                 ps[2 * s] = ol; ps[2 * s + 1] = orr;
             }
+
+            // Write the hot state back.
+            this.gIn = gIn; this.eqMix = eqMix; this.lcMix = lcMix; this.compOn = compOn; this.makeup = makeup;
+            this.mix = mix; this.lmMix = lmMix; this.width = width; this.limOn = limOn; this.limGain = limGain;
+            this.ceilLin = ceilLin; this.bypass = bypass; this.slopeMix = slopeMix; this.gMaster = gMaster; this.gDry = gDry;
+            this.detMs = detMs; this.grFast = grFast; this.grSlow = grSlow;
+            this.prevPk = prevPk; this.relState = relState;
+            this.dqHead = dqHead; this.dqTail = dqTail; this.boxPos = boxPos; this.sampleIdx = sampleIdx; this.dw = dw;
+            this.boxSum = boxSum; this.blockFill = blockFill; this.blockSum = blockSum; this.inBlockSum = inBlockSum;
 
             float limGrDb = minLimG < 1.0f ? -20.0f * MathF.Log10(minLimG > 1e-6f ? minLimG : 1e-6f) : 0.0f;
 

@@ -509,8 +509,14 @@ namespace PedalMasterN
                 double den = Math.Sqrt(mLL * mRR);
                 corr = den > 1e-9 ? Math.Max(-1, Math.Min(1, mLR / den)) : double.NaN;
             }
-            InvalidateVisual();
+            // Redraw only when something visible changed (nothing does while stopped).
+            int shown = HashCode.Combine(
+                HashCode.Combine(inL.Shown, inR.Shown, outL.Shown, outR.Shown, comp.Shown, lim.Shown),
+                Theme.Q(loud.Momentary), Theme.Q(loud.ShortTerm), Theme.Q(loud.Integrated), Theme.Q(loud.Range),
+                Theme.Q(corr, 0.01));
+            if (shown != lastShown) { lastShown = shown; InvalidateVisual(); }
         }
+        int lastShown;
 
         protected override void OnMouseLeftButtonDown(MouseButtonEventArgs e)
         {

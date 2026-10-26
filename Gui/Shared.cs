@@ -78,6 +78,9 @@ namespace PedalMasterN
         }
 
         public double RmsDb => MeanSq > 1e-12 ? 10.0 * Math.Log10(MeanSq) : DB_MIN;
+
+        // What the meters show, rounded to what can be seen (for change detection).
+        public int Shown => HashCode.Combine(Theme.Q(PeakDb), Theme.Q(HoldDb), Theme.Q(RmsDb), Clipped);
     }
 
     // Gain-reduction meter: follows the machine's max-since-last-read directly
@@ -96,6 +99,8 @@ namespace PedalMasterN
             if (Db >= HoldDb) { HoldDb = Db; holdAge = 0; }
             else if ((holdAge += dt) > HOLD_SECONDS) HoldDb = Math.Max(Db, HoldDb - FALL_DB_PER_S * dt);
         }
+
+        public int Shown => HashCode.Combine(Theme.Q(Db), Theme.Q(HoldDb));
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -190,13 +195,39 @@ namespace PedalMasterN
         static Brush A(byte a, byte r, byte g, byte b) { var x = new SolidColorBrush(Color.FromArgb(a, r, g, b)); x.Freeze(); return x; }
         static Pen P(Brush b) { var p = new Pen(b, 1); p.Freeze(); return p; }
 
+        // Building a FormattedText is expensive, and the meters draw dozens per frame,
+        // most of them the same strings again (scale labels, readouts that hold still).
+        // They are cached by content; UI thread only.
+        readonly struct TextKey : IEquatable<TextKey>
+        {
+            readonly string s; readonly double size, ppd; readonly Brush brush; readonly bool bold;
+            public TextKey(string s, double size, Brush brush, bool bold, double ppd)
+            { this.s = s; this.size = size; this.brush = brush; this.bold = bold; this.ppd = ppd; }
+            public bool Equals(TextKey o) => s == o.s && size == o.size && ReferenceEquals(brush, o.brush) && bold == o.bold && ppd == o.ppd;
+            public override bool Equals(object o) => o is TextKey k && Equals(k);
+            public override int GetHashCode() => HashCode.Combine(s, size, brush, bold, ppd);
+        }
+        static readonly System.Collections.Generic.Dictionary<TextKey, FormattedText> textCache =
+            new System.Collections.Generic.Dictionary<TextKey, FormattedText>();
+
         public static FormattedText Text(Visual v, string s, double size, Brush brush, bool bold = false)
         {
             double ppd = 1.0;
             try { ppd = VisualTreeHelper.GetDpi(v).PixelsPerDip; } catch { }
-            return new FormattedText(s ?? "", CultureInfo.InvariantCulture, FlowDirection.LeftToRight,
-                                     bold ? MonoBold : Mono, size, brush, ppd);
+            s ??= "";
+            var key = new TextKey(s, size, brush, bold, ppd);
+            if (textCache.TryGetValue(key, out var ft)) return ft;
+            if (textCache.Count >= 4096) textCache.Clear();
+            ft = new FormattedText(s, CultureInfo.InvariantCulture, FlowDirection.LeftToRight,
+                                   bold ? MonoBold : Mono, size, brush, ppd);
+            textCache[key] = ft;
+            return ft;
         }
+
+        // Rounds a value to what the meters can show, for change detection.
+        public static int Q(double v, double step = 0.1) =>
+            double.IsNaN(v) ? int.MinValue : double.IsInfinity(v) ? (v > 0 ? int.MaxValue : int.MinValue + 1)
+            : (int)Math.Round(Math.Max(-1e6, Math.Min(1e6, v)) / step);
 
         public static string Db(double db) =>
             db <= LevelBallistics.DB_MIN + 0.5 ? "-∞"

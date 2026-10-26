@@ -215,7 +215,7 @@ namespace PedalMasterN
 
         void OnFrame(object sender, EventArgs e)
         {
-            if (clock.Elapsed.TotalSeconds - lastTick < 1.0 / 62) return;
+            if (clock.Elapsed.TotalSeconds - lastTick < 1.0 / 31) return;     // ~30 fps is plenty for meters
             Poll();
         }
 
@@ -258,7 +258,7 @@ namespace PedalMasterN
             for (int i = 0; i < f.BlockCount; i++) loudness.Meter.Add(f.Blocks[i]);
             loudness.AddTruePeak(Math.Max(f.OutTpL, f.OutTpR));
             loudness.UpdateCorrelation(f.LL, f.LR, f.RR, dt);
-            loudness.InvalidateVisual();
+            loudness.RedrawIfChanged();
         }
 
         static Border MakeButton(string text, string tooltip, Action onClick)
@@ -324,8 +324,10 @@ namespace PedalMasterN
                 lv[2].Update(f.OutTpL, f.OutMsL, dt); lv[3].Update(f.OutTpR, f.OutMsR, dt);
                 comp.Update(f.CompGr, dt); lim.Update(f.LimGr, dt);
             }
-            InvalidateVisual();
+            int shown = HashCode.Combine(lv[0].Shown, lv[1].Shown, lv[2].Shown, lv[3].Shown, comp.Shown, lim.Shown);
+            if (shown != lastShown) { lastShown = shown; InvalidateVisual(); }
         }
+        int lastShown;
 
         protected override void OnRender(DrawingContext dc)
         {
@@ -505,6 +507,18 @@ namespace PedalMasterN
         }
 
         const double LU_BELOW = 20, LU_ABOVE = 10;
+
+        // Redraw only when something visible changed (nothing does while stopped).
+        int lastShown;
+        public void RedrawIfChanged()
+        {
+            bool flashing = flash != null && DateTime.UtcNow < flashUntil;
+            int shown = HashCode.Combine(
+                HashCode.Combine(Theme.Q(Meter.Momentary), Theme.Q(Meter.ShortTerm), Theme.Q(Meter.Integrated), Theme.Q(Meter.Range)),
+                Theme.Q(Meter.MaxMomentary), Theme.Q(Meter.MaxShortTerm), Theme.Q(maxTp, 1e-4),
+                Theme.Q(Correlation, 0.01), target, flashing);
+            if (shown != lastShown) { lastShown = shown; InvalidateVisual(); }
+        }
 
         protected override void OnRender(DrawingContext dc)
         {
