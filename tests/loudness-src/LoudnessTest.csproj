@@ -1,0 +1,9 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- The GUI's loudness maths (Gui/Loudness.cs has no WPF) as a console test. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework><Nullable>disable</Nullable>
+    <AssemblyName>lt</AssemblyName><InvariantGlobalization>true</InvariantGlobalization>
+    <DebugType>none</DebugType><DebugSymbols>false</DebugSymbols><GenerateDependencyFile>false</GenerateDependencyFile>
+  </PropertyGroup>
+  <ItemGroup><Compile Include="../../Gui/Loudness.cs" Link="Loudness.cs" /></ItemGroup>
+</Project>

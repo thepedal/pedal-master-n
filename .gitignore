@@ -1,0 +1,9 @@
+bin/
+obj/
+tests/build/
+tests/harness.dll
+tests/harness
+tests/harness.exe
+tests/harness.runtimeconfig.json
+*.user
+.vs/

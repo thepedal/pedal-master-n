@@ -1,0 +1,77 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Pedal Master N — mastering machine for ReBuzz (managed effect + embedded WPF GUI).
+
+    Build (Developer PowerShell, elevated if ReBuzz is under Program Files):
+      dotnet build PedalMasterN.NET.csproj -c Release
+    Override the ReBuzz install folder:
+      dotnet build -c Release -p:ReBuzzDir="D:\ReBuzz"
+
+    Output: "Pedal Master N.NET.dll" (the .NET suffix routes it to ReBuzz's managed
+    loader, Build §2), deployed to $(ReBuzzDir)\Gear\Effects. Only the .dll is
+    deployed (Build §1). Host DLLs are referenced with Private=false and are never
+    copied or redistributed (Licensing §1.1).
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <AssemblyName>Pedal Master N.NET</AssemblyName>
+    <RootNamespace>PedalMasterN</RootNamespace>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <Optimize>true</Optimize>
+
+    <!-- Deployment hygiene (mandatory): ReBuzz only needs the .dll. -->
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+    <GenerateDependencyFile>false</GenerateDependencyFile>
+
+    <!-- Version conflicts from ReBuzz's transitive references are harmless (Build §4). -->
+    <NoWarn>$(NoWarn);MSB3277</NoWarn>
+
+    <ReBuzzDir Condition="'$(ReBuzzDir)' == ''">C:\Program Files\ReBuzz</ReBuzzDir>
+
+    <AssemblyTitle>Pedal Master N</AssemblyTitle>
+    <Company>thepedal</Company>
+    <Copyright>Copyright (c) 2026 thepedal. MIT License.</Copyright>
+    <Product>Pedal Master N</Product>
+    <Version>1.0.0</Version>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- The headless test harness is a separate project. -->
+    <Compile Remove="tests/**" />
+    <None Remove="tests/**" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="BuzzGUI.Interfaces">
+      <HintPath>$(ReBuzzDir)\BuzzGUI.Interfaces.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <!-- MenuItemVM and SimpleCommand for the right-click menu (AboutWindow §1.1). -->
+    <Reference Include="BuzzGUI.Common">
+      <HintPath>$(ReBuzzDir)\BuzzGUI.Common.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+  <!-- Fail early with a clear message if the host DLLs are missing. -->
+  <Target Name="CheckHostRefs" BeforeTargets="ResolveAssemblyReferences">
+    <Error Condition="!Exists('$(ReBuzzDir)\BuzzGUI.Interfaces.dll')"
+           Text="BuzzGUI.Interfaces.dll not found in $(ReBuzzDir). Build with -p:ReBuzzDir=&lt;your ReBuzz folder&gt;." />
+  </Target>
+
+  <!-- Deploy: the .dll only, to Gear\Effects (Build §1.3). ContinueOnError keeps the
+       build green while ReBuzz holds the old DLL open: close ReBuzz and rebuild. -->
+  <Target Name="DeployToReBuzz" AfterTargets="Build">
+    <Message Importance="high" Text="Deploying $(TargetFileName) -> $(ReBuzzDir)\Gear\Effects\" />
+    <Copy SourceFiles="$(TargetPath)"
+          DestinationFolder="$(ReBuzzDir)\Gear\Effects\"
+          ContinueOnError="true" />
+  </Target>
+
+</Project>
