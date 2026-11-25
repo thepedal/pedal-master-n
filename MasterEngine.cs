@@ -27,11 +27,17 @@
 //     envelopes that can decay into the denormal range are flushed explicitly
 //     (Core §30);
 //   - the meter link is a direct method call (ReadMeters) instead of a GUI
-//     message, filling the same values the protocol v2 reply carried.
+//     message, filling the same values the protocol v2 reply carried;
+//   - v1.2: stereo filters run both channels in one Vector128<double> (bit-
+//     identical); Low Mono's mid LR4 sum is one all-pass; the limiter detector
+//     and the true-peak meter test a tighter bound (central taps exact) before
+//     their full search; metering runs only while it is read or Match is on;
+//     the dry and master K-weighting run as one 4-lane filter.
 //
 // MIT License — Copyright (c) 2026 thepedal. See LICENSE.
 
 using System;
+using System.Runtime.Intrinsics;
 using System.Threading;
 
 namespace PedalMasterN
@@ -155,15 +161,18 @@ namespace PedalMasterN
         double lcHz = 20, lsHz = 100, lsDb = 0, hsHz = 10000, hsDb = 0, tiltDb = 0;
         double lsK = SHELF_K_CLEAN, dipDb = 0;               // shelf corner, dip depth (<= 0)
         double lmHz = 120;
-        readonly Svf lowCut = new Svf(), lowCut24a = new Svf(), lowCut24b = new Svf();
-        readonly Svf lowShelf = new Svf(), highShelf = new Svf(), lowDip = new Svf();
-        readonly Svf dcBlock = new Svf();                     // 5 Hz, always on
-        readonly Tilt1 tilt = new Tilt1();                    // first order, fixed 1 kHz pivot
-        readonly Svf lmLp1 = new Svf(), lmLp2 = new Svf(), lmHp1 = new Svf(), lmHp2 = new Svf(),
-                     lmSHp1 = new Svf(), lmSHp2 = new Svf(); // Low Mono LR4 crossover
-        readonly Svf[] lmAll;
+        // Stereo filters run left and right together (two-lane vectors, Dsp.cs).
+        readonly SvfV lowCut = new SvfV(), lowCut24a = new SvfV(), lowCut24b = new SvfV();
+        readonly SvfV lowShelf = new SvfV(), highShelf = new SvfV(), lowDip = new SvfV();
+        readonly SvfV dcBlock = new SvfV();                   // 5 Hz, always on
+        readonly Tilt1V tilt = new Tilt1V();                  // first order, fixed 1 kHz pivot
+        // Low Mono, on (mid, side): an LR4 crossover's low and high halves summed are
+        // exactly a 2nd-order all-pass, so the mid channel needs one filter (lane 0
+        // of lmA; lmB passes it through) while the side channel gets the LR4 high-pass
+        // (lane 1 of both).
+        readonly SvfV lmA = new SvfV(), lmB = new SvfV();
         int scHpfSel = -1;
-        readonly Biquad scHpf = new Biquad();
+        readonly BiquadV scHpf = new BiquadV();
 
         // Compressor (gain reduction in dB, >= 0).
         float grFast, grSlow;
@@ -172,6 +181,9 @@ namespace PedalMasterN
         // Limiter.
         int look = 96;                                        // look-ahead, samples
         readonly Mirror hist = new Mirror(Interp.DET_TAPS);   // detector history
+        // max(|L|, |R|) of the same samples, mirrored like hist: the bound test reads
+        // one window instead of two.
+        readonly float[] pkRing = new float[2 * Interp.DET_TAPS];
         float prevPk;
         readonly float[] dqVal = new float[RING];
         readonly int[] dqIdx = new int[RING];
@@ -187,12 +199,12 @@ namespace PedalMasterN
 
         // Output metering.
         readonly Mirror mh = new Mirror(Interp.TP_TAPS);      // output true-peak meter history
-        readonly Biquad kS = new Biquad(), kH = new Biquad();
+        // K-weighting (BS.1770): lanes = dry L, dry R (for Match), master L, master R.
+        readonly BiquadV4 kS = new BiquadV4(), kH = new BiquadV4();
         int blockLen, blockFill;
         double blockSum;
 
         // Match: K-weighted loudness of the dry input vs the master, per 100 ms block.
-        readonly Biquad kSi = new Biquad(), kHi = new Biquad();
         double inBlockSum;
         double avgIn, avgOut;
         volatile float matchDb;
@@ -224,6 +236,19 @@ namespace PedalMasterN
         }
         readonly MeterAcc[] meterAcc = new MeterAcc[METER_SLOTS];
         int meterLock;
+
+        // Metering (levels, true peak, K-weighted loudness, correlation, the dry
+        // loudness for Match) only runs while somebody uses it: a meter display read
+        // it within the last second, or Match is on. With the parameter window and
+        // the meter window closed it costs nothing.
+        long clock;                     // samples processed
+        // The highest master true peak since any slot was last read: every slot's
+        // peak is at least this, so a window that can't exceed it can't change any
+        // slot, and its interpolation is skipped. Reset by every read.
+        float tpFloorL, tpFloorR;
+        int readSeq, readSeqSeen;
+        long lastReadClock = long.MinValue / 2;
+        bool meteringWas, settling;
         readonly float[] doneBlocks = new float[4];
 
         void LockMeters()   { while (Interlocked.Exchange(ref meterLock, 1) != 0) Thread.SpinWait(1); }
@@ -231,7 +256,6 @@ namespace PedalMasterN
 
         public MasterEngine()
         {
-            lmAll = new[] { lmLp1, lmLp2, lmHp1, lmHp2, lmSHp1, lmSHp2 };
             for (int s = 0; s < METER_SLOTS; s++) { meterAcc[s] = new MeterAcc(); meterAcc[s].Clear(); }
         }
 
@@ -258,10 +282,9 @@ namespace PedalMasterN
             Array.Clear(dRawL); Array.Clear(dRawR);
             for (int j = 0; j < RING; j++) box[j] = 1.0f;
             boxSum = look; boxPos = 0; dqHead = dqTail = 0; relState = 1; prevPk = 0;
-            hist.Reset(); mh.Reset(); dw = 0; sampleIdx = 0;
+            hist.Reset(); mh.Reset(); Array.Clear(pkRing); dw = 0; sampleIdx = 0;
 
             kS.KShelf(sr); kH.KHighPass(sr); kS.Reset(); kH.Reset();
-            kSi.KShelf(sr); kHi.KHighPass(sr); kSi.Reset(); kHi.Reset();
             inBlockSum = 0; avgIn = avgOut = 0; matchDb = 0.0f;
             e0L = e1L = e2L = e0R = e1R = e2R = 0.0f;
             dcBlock.HighPass(sr, 5.0, 0.70710678); dcBlock.Apply(0); dcBlock.Reset();
@@ -269,9 +292,12 @@ namespace PedalMasterN
 
             lowCut.Reset(); lowCut24a.Reset(); lowCut24b.Reset(); lowShelf.Reset(); highShelf.Reset(); tilt.Reset();
             lowDip.Reset();
-            foreach (var f in lmAll) f.Reset();
+            lmA.Reset(); lmB.Reset();
             scHpf.Reset(); scHpfSel = -1;
             lc12Live = lc24Live = lsLive = dipLive = hsLive = tiltLive = lmLive = false;
+            // The loudness filters and blocks were just reset, as if metering had been
+            // running: if it is in use from the start nothing needs restarting or settling.
+            meteringWas = true; settling = false;
             first = true;
         }
 
@@ -344,11 +370,8 @@ namespace PedalMasterN
             if (lmDirty)
             {
                 const double q = 0.70710678;       // Butterworth² = Linkwitz-Riley 4th order
-                for (int i = 0; i < 6; i++)
-                {
-                    if (i < 2) lmAll[i].LowPass(sr, lmHz, q); else lmAll[i].HighPass(sr, lmHz, q);
-                    lmAll[i].Apply(ramp);
-                }
+                lmA.AllPass(sr, lmHz, q, 0);  lmA.HighPass(sr, lmHz, q, 1);  lmA.Apply(ramp);
+                lmB.Through(sr, lmHz, q, 0);  lmB.HighPass(sr, lmHz, q, 1);  lmB.Apply(ramp);
             }
 
             int sel = V[P_SCHPF];
@@ -390,7 +413,7 @@ namespace PedalMasterN
         // its gain is still at (or within a hair of) neutral, so it is inaudible.
         bool lc12Live, lc24Live, lsLive, dipLive, hsLive, tiltLive, lmLive;
 
-        static bool Engage(bool run, ref bool live, Svf a, Svf b = null)
+        static bool Engage(bool run, ref bool live, SvfV a, SvfV b = null)
         {
             if (run && !live) { a.Reset(); b?.Reset(); }
             live = run;
@@ -506,7 +529,7 @@ namespace PedalMasterN
             double boxSum = this.boxSum;
             int blockFill = this.blockFill, blockLen = this.blockLen;
             double blockSum = this.blockSum, inBlockSum = this.inBlockSum;
-            float[] box = this.box, dqVal = this.dqVal; int[] dqIdx = this.dqIdx;
+            float[] box = this.box, dqVal = this.dqVal, pkRing = this.pkRing; int[] dqIdx = this.dqIdx;
             float[] dPreL = this.dPreL, dPreR = this.dPreR, dLimL = this.dLimL, dLimR = this.dLimR, dRawL = this.dRawL, dRawR = this.dRawR;
             Mirror hist = this.hist, mh = this.mh;
             float detBound = Interp.DetBound, tpBound = Interp.TpBound;
@@ -519,6 +542,23 @@ namespace PedalMasterN
             int nDone = 0;
             double cLL = 0, cLR = 0, cRR = 0;
             const double invFs = 1.0 / FULL_SCALE;
+            var vFs = Vector128.Create((double)FULL_SCALE);
+            bool metering = v[P_MATCH] != 0 || clock - Volatile.Read(ref lastReadClock) < sr;
+            if (metering && !meteringWas)
+            {
+                // Starting again after a pause: the loudness filters and blocks are
+                // stale, and so is any Match estimate; start them fresh, and drop the
+                // first 100 ms block while the filters settle. (The true-peak history
+                // keeps running while metering is off, so it has no jump to ring on.)
+                kS.Reset(); kH.Reset();
+                blockFill = 0; blockSum = 0; inBlockSum = 0; settling = true;
+                avgIn = avgOut = 0; matchDb = 0.0f;
+            }
+            meteringWas = metering;
+            Volatile.Write(ref clock, clock + n);
+            int seq = Volatile.Read(ref readSeq);
+            if (seq != readSeqSeen) { readSeqSeen = seq; this.tpFloorL = this.tpFloorR = 0; }
+            float tpFloorL = this.tpFloorL, tpFloorR = this.tpFloorR;
             const int RM = RING - 1;
 
             bool eqRun = false, lc12 = false, lc24 = false, ls = false, dip = false, hs = false, tl = false, lm = false;
@@ -545,7 +585,7 @@ namespace PedalMasterN
                     if (tRun && !tiltLive) tilt.Reset();
                     tiltLive = tl = tRun;
                     lm = !(lmMix == 0.0f && tLm == 0.0f);
-                    if (lm && !lmLive) foreach (var f in lmAll) f.Reset();
+                    if (lm && !lmLive) { lmA.Reset(); lmB.Reset(); }
                     lmLive = lm;
                     compRun = !(compOn == 0.0f && tComp == 0.0f);
                     if (!compRun)
@@ -562,11 +602,14 @@ namespace PedalMasterN
 
                 float inL = ps[2 * s], inR = ps[2 * s + 1];
 
-                float a = MathF.Abs(inL), b = MathF.Abs(inR);
-                if (a > inPkL) inPkL = a;
-                if (b > inPkR) inPkR = b;
-                inSqL += (double)inL * inL;
-                inSqR += (double)inR * inR;
+                if (metering)
+                {
+                    float a = MathF.Abs(inL), b = MathF.Abs(inR);
+                    if (a > inPkL) inPkL = a;
+                    if (b > inPkR) inPkR = b;
+                    inSqL += (double)inL * inL;
+                    inSqR += (double)inR * inR;
+                }
 
                 if (gliding)
                 {
@@ -578,46 +621,37 @@ namespace PedalMasterN
                     gMaster = Glide(gMaster, tGM, kMatch); gDry = Glide(gDry, tGD, kMatch);
                 }
 
-                // ── Dry loudness for Match (K-weighted, per 100 ms block) ──
-                {
-                    double nl = inL / FULL_SCALE, nr = inR / FULL_SCALE;
-                    double kl = kHi.Run(0, kSi.Run(0, nl)), kr = kHi.Run(1, kSi.Run(1, nr));
-                    inBlockSum += kl * kl + kr * kr;
-                }
-
                 // ── Input trim, DC blocker (5 Hz, 2nd order, always on) ──
-                double xl = inL * gIn, xr = inR * gIn;
-                dcBlock.Run2(ref xl, ref xr);
+                // x = (left, right) from here to the limiter.
+                var x = dcBlock.Run(Vector128.Create((double)(inL * gIn), inR * gIn));
 
                 // ── EQ ──
                 if (eqRun)
                 {
-                    double yl = xl, yr = xr;
+                    var y = x;
                     if (lc12 || lc24)
                     {
-                        double hl = xl, hr = xr, ql = xl, qr = xr;
-                        if (lc12) lowCut.Run2(ref hl, ref hr);            // 12 dB/oct
-                        if (lc24) { lowCut24a.Run2(ref ql, ref qr); lowCut24b.Run2(ref ql, ref qr); }   // 24 dB/oct
-                        if (!lc12) { hl = ql; hr = qr; }
-                        else if (lc24) { hl += (ql - hl) * slopeMix; hr += (qr - hr) * slopeMix; }
-                        yl = xl + (hl - xl) * lcMix; yr = xr + (hr - xr) * lcMix;
+                        Vector128<double> h = x, q2 = x;
+                        if (lc12) h = lowCut.Run(x);                                // 12 dB/oct
+                        if (lc24) q2 = lowCut24b.Run(lowCut24a.Run(x));             // 24 dB/oct
+                        if (!lc12) h = q2;
+                        else if (lc24) h += (q2 - h) * Vector128.Create((double)slopeMix);
+                        y = x + (h - x) * Vector128.Create((double)lcMix);
                     }
-                    if (ls)  lowShelf.Run2(ref yl, ref yr);
-                    if (dip) lowDip.Run2(ref yl, ref yr);
-                    if (hs)  highShelf.Run2(ref yl, ref yr);
-                    if (tl) tilt.Run2(ref yl, ref yr);
-                    xl += (yl - xl) * eqMix;
-                    xr += (yr - xr) * eqMix;
+                    if (ls)  y = lowShelf.Run(y);
+                    if (dip) y = lowDip.Run(y);
+                    if (hs)  y = highShelf.Run(y);
+                    if (tl)  y = tilt.Run(y);
+                    x += (y - x) * Vector128.Create((double)eqMix);
                 }
 
                 // ── Glue compressor (feed-forward, log domain, stereo-linked) ──
                 // The RMS detector always runs; the per-sample gain computer only while
                 // the compressor is on (off, the envelopes are tracked every EQ_STEP).
                 {
-                    double sl = xl, sr2 = xr;
-                    if (useSc) { sl = scHpf.Run(0, xl); sr2 = scHpf.Run(1, xr); }
-                    double ql = sl / FULL_SCALE, qr = sr2 / FULL_SCALE;
-                    double q  = ql * ql > qr * qr ? ql * ql : qr * qr;
+                    var qv = (useSc ? scHpf.Run(x) : x) / vFs;
+                    qv *= qv;
+                    double q = Math.Max(qv.GetElement(0), qv.GetElement(1));   // louder side
                     detMs += (q - detMs) * aDet;
                     if (compRun)
                     {
@@ -634,21 +668,22 @@ namespace PedalMasterN
                         float gc  = grTot > 0.0f ? DbToLin(-grTot) : 1.0f;
                         float eff = makeup * (1.0f - mix + mix * gc);
                         float g   = 1.0f + (eff - 1.0f) * compOn;
-                        xl *= g; xr *= g;
+                        x *= Vector128.Create((double)g);
                         float shown = grTot * compOn * mix;
                         if (shown > maxCompGr) maxCompGr = shown;
                     }
                 }
 
                 // ── Stereo: Low Mono (LR4 on the side channel) and Width ──
+                double xl, xr;
                 {
-                    double M = (xl + xr) * 0.5, S = (xl - xr) * 0.5;
+                    double l0 = x.GetElement(0), r0 = x.GetElement(1);
+                    double M = (l0 + r0) * 0.5, S = (l0 - r0) * 0.5;
                     if (lm)
                     {
-                        double mAp = lmLp2.Run1(lmLp1.Run1(M)) + lmHp2.Run1(lmHp1.Run1(M));   // LR4 sum = all-pass
-                        double sHp = lmSHp2.Run1(lmSHp1.Run1(S));
-                        M += (mAp - M) * lmMix;
-                        S += (sHp - S) * lmMix;
+                        var ms = Vector128.Create(M, S);
+                        ms += (lmB.Run(lmA.Run(ms)) - ms) * Vector128.Create((double)lmMix);   // (all-pass mid, high-passed side)
+                        M = ms.GetElement(0); S = ms.GetElement(1);
                     }
                     S *= width;
                     xl = M + S; xr = M - S;
@@ -668,18 +703,16 @@ namespace PedalMasterN
                 float G;
                 {
                     hist.Push(gl, gr2);
-                    int wo = hist.WinOffset;
+                    int wo = hist.WinOffset, hp = hist.Pos;
+                    pkRing[hp] = pkRing[hp + Interp.DET_TAPS] = MathF.Max(MathF.Abs(gl), MathF.Abs(gr2));
                     // The interpolated peak can't exceed DetBound × the window's largest
                     // sample. Below the ceiling that bound gives exactly the same
                     // attenuation (1) as the full 8-phase search, so the search is skipped.
-                    float bound = MathF.Max(Interp.MaxAbs(hist.L, wo, Interp.DET_TAPS), Interp.MaxAbs(hist.R, wo, Interp.DET_TAPS)) * detBound;
-                    float ipk;
-                    if (bound < ceilLin) ipk = bound;
-                    else
-                    {
-                        Interp.DetPeak(hist.L, hist.R, wo, out float ipkL, out float ipkR);
-                        ipk = ipkL > ipkR ? ipkL : ipkR;
-                    }
+                    // Loud material fails that bound, so DetPeakTiered tries a tighter one
+                    // (the 16 central taps exactly) before completing the full search.
+                    float wmax = Interp.MaxAbs(pkRing, wo, Interp.DET_TAPS);
+                    float bound = wmax * detBound;
+                    float ipk = bound < ceilLin ? bound : Interp.DetPeakTiered(hist.L, hist.R, wo, ceilLin, wmax);
                     float need = ipk > prevPk ? ipk : prevPk;
                     prevPk = ipk;
                     float att = need > ceilLin ? ceilLin / need : 1.0f;
@@ -721,30 +754,42 @@ namespace PedalMasterN
                 }
 
                 // ── Output metering: the master (before Bypass, Match and Dither) ──
+                mh.Push(ol, orr);
+                if (metering)
+                {
                 outSqL += (double)ol * ol;
                 outSqR += (double)orr * orr;
-                mh.Push(ol, orr);
                 {
                     // A window whose bound can't beat the block's peak so far can't change it.
                     int mo = mh.WinOffset;
-                    if (Interp.MaxAbs(mh.L, mo, Interp.TP_TAPS) * tpBound > outTpL)
-                    { float t0 = Interp.TpPeak(mh.L, mo); if (t0 > outTpL) outTpL = t0; }
-                    if (Interp.MaxAbs(mh.R, mo, Interp.TP_TAPS) * tpBound > outTpR)
-                    { float t1 = Interp.TpPeak(mh.R, mo); if (t1 > outTpR) outTpR = t1; }
+                    float mxL = Interp.MaxAbs(mh.L, mo, Interp.TP_TAPS), mxR = Interp.MaxAbs(mh.R, mo, Interp.TP_TAPS);
+                    if (mxL * tpBound > tpFloorL)
+                    { float t0 = Interp.TpPeakTiered(mh.L, mo, tpFloorL, mxL); if (t0 > outTpL) outTpL = t0; if (t0 > tpFloorL) tpFloorL = t0; }
+                    if (mxR * tpBound > tpFloorR)
+                    { float t1 = Interp.TpPeakTiered(mh.R, mo, tpFloorR, mxR); if (t1 > outTpR) outTpR = t1; if (t1 > tpFloorR) tpFloorR = t1; }
                 }
 
                 {
                     double nl = ol * invFs, nr = orr * invFs;
                     cLL += nl * nl; cLR += nl * nr; cRR += nr * nr;
-                    double kl = kH.Run(0, kS.Run(0, nl)), kr = kH.Run(1, kS.Run(1, nr));
-                    blockSum += kl * kl + kr * kr;
+                    // K-weighted energy of the dry input (for Match) and of the master,
+                    // per 100 ms block, in one 4-lane filter.
+                    var kw = kH.Run(kS.Run(Vector256.Create((double)(inL / FULL_SCALE), inR / FULL_SCALE, nl, nr)));
+                    kw *= kw;
+                    inBlockSum += kw.GetElement(0) + kw.GetElement(1);
+                    blockSum   += kw.GetElement(2) + kw.GetElement(3);
                 }
                 if (++blockFill >= blockLen)
                 {
                     double eOut = blockSum / blockLen, eIn = inBlockSum / blockLen;
-                    if (nDone < 4) doneBlocks[nDone++] = (float)eOut;
-                    UpdateMatch(eIn, eOut);
+                    if (settling) settling = false;
+                    else
+                    {
+                        if (nDone < 4) doneBlocks[nDone++] = (float)eOut;
+                        UpdateMatch(eIn, eOut);
+                    }
                     blockSum = 0; inBlockSum = 0; blockFill = 0;
+                }
                 }
 
                 // ── Bypass (to the delayed dry input), level-matched when Match is on ──
@@ -777,7 +822,9 @@ namespace PedalMasterN
             this.prevPk = prevPk; this.relState = relState;
             this.dqHead = dqHead; this.dqTail = dqTail; this.boxPos = boxPos; this.sampleIdx = sampleIdx; this.dw = dw;
             this.boxSum = boxSum; this.blockFill = blockFill; this.blockSum = blockSum; this.inBlockSum = inBlockSum;
+            this.tpFloorL = tpFloorL; this.tpFloorR = tpFloorR;
 
+            if (!metering) return;
             float limGrDb = minLimG < 1.0f ? -20.0f * MathF.Log10(minLimG > 1e-6f ? minLimG : 1e-6f) : 0.0f;
 
             LockMeters();
@@ -842,7 +889,8 @@ namespace PedalMasterN
         // running the DSP.
         public void Idle(int n)
         {
-            if (blockLen <= 0 || n <= 0) return;
+            Volatile.Write(ref clock, clock + n);
+            if (blockLen <= 0 || n <= 0 || !meteringWas) return;
             int nDone = 0;
             blockFill += n;
             while (blockFill >= blockLen)
@@ -869,6 +917,8 @@ namespace PedalMasterN
         public bool ReadMeters(int slot, MeterFrame f)
         {
             if (f == null || slot < 0 || slot >= METER_SLOTS) return false;
+            Volatile.Write(ref lastReadClock, Volatile.Read(ref clock));
+            Interlocked.Increment(ref readSeq);
             const float inv = 1.0f / FULL_SCALE;
             LockMeters();
             var a = meterAcc[slot];

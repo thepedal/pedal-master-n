@@ -3,7 +3,8 @@
 Mastering machine for **ReBuzz**, as a managed effect on .NET 10. Stereo in → stereo out;
 put it last in the chain, just before Master.
 
-**Status: v1.0.0**, the first ReBuzz release. It is a port of the Buzz 1503 native machine
+**Status: v1.2.0.** v1.2 is a CPU release: about 35 % less CPU with a full mastering setup and
+55 % less at the defaults, with the same sound (see *v1.2* below). It is a port of the Buzz 1503 native machine
 Pedal Master N v0.4.0 (C++, 32-bit), and keeps all of it:
 
 - the same 28 parameters, in the same order, with the same ranges and defaults;
@@ -13,7 +14,27 @@ Pedal Master N v0.4.0 (C++, 32-bit), and keeps all of it:
   −97 dBFS of it (−132 dBFS in most), and every meter reading within 0.1 % (see *Tests*);
 - the parameter panel and the meter window, now inside the machine DLL.
 
-What is new for ReBuzz:
+### v1.2
+
+- **About 35 % less CPU with a full mastering setup** (Low Cut, compressor, Low Mono and limiter on),
+  **38 % less while the limiter works hard**, and **55 % less at the defaults**:
+  - Every stereo filter (DC blocker, Low Cut, shelves, Low Dip, Tilt, sidechain high-pass) runs
+    left and right together in one vector instruction. Bit-identical to before.
+  - Low Mono: an LR4 crossover's low and high halves summed are exactly a 2nd-order all-pass, so
+    the mid channel needs one filter instead of four.
+  - Limiter: on a loud master the quick peak bound (+7.6 dB of margin) almost always failed, so the
+    8× detector ran a full search every sample. A middle step now computes the 16 central taps
+    exactly and bounds the rest (within 0.5 dB); only if that can't rule out the ceiling does it
+    finish the full search, reusing what it already summed.
+  - **Metering only runs while it is used:** while the parameter window and the meter window are
+    closed and Match is off, the level, true-peak and loudness meters are not computed at all.
+    They start again the moment a display opens.
+  - The true-peak meter uses the same kind of middle step, and skips windows that can't exceed the
+    peak already recorded since the last read. The dry and master loudness filters run as one.
+- Sound: within −97 dBFS of v1.1 at worst (compressor switched on live), −126 dBFS or less
+  otherwise; every test result the same as v1.1.
+
+What is new for ReBuzz (v1.0/v1.1):
 
 - **About 3.5× less CPU at the defaults**, 1.5–2× less with everything in use:
   - Sections that are switched off, or exactly flat, are not computed at all. At the defaults
@@ -245,18 +266,20 @@ harness, so the native test scripts run unchanged. Results:
 | Check | Result |
 |---|---|
 | **Against the native C++ build** (`equivalence.py`), 16 scenarios | all pass: output within −132 dBFS in most, −97 dBFS at worst (compressor switched on live), dither within its LSB; meters within 0.1 %; latency 103 / 111 / 207 at 44.1 / 48 / 96 kHz on both |
-| Native regression script `t11.py` against the C++ build, 9 scenarios | defaults, EQ, and limiter and compressor off: identical; limiting: −132 dBFS; compressor switched on mid-way: −86 dBFS |
+| Native regression script `t11.py` against the C++ build, 9 scenarios | defaults, EQ, and limiter and compressor off: identical; limiting: −129 dBFS; compressor switched on mid-way: −86 dBFS |
+| v1.2 against v1.1 | every test in this table gives the same result; output within −97 dBFS (−126 dBFS outside the compressor switched on live) |
+| Metering restart (meters unread for a while, then a display opens) | first readings correct: level, true peak and loudness of a −20 dBFS sine read −20.00 dBFS, −20.00 dBTP and −19.99 LUFS; Match switched on with no display open estimates correctly |
 | Clicks (`t8.py`, and `t8b.py` for every switch-on that section skipping adds) | max Δ² after the change ≈ the steady value in every case (0.4–1.1); Tilt 0 → +6 dB 0.94, was 12.96 in v0.4.0 |
 | Native test scripts t1 to t12 | the same numbers as the native build, line for line; e.g. transparency residual −43 dB at 1 kHz, Low Cut 30 Hz 24 dB/oct −49.3 / −24.4 / −3.1 dB at 7.5 / 15 / 30 Hz, limiter worst overshoot +0.21 dB (white noise, 20 dB GR), EBU 3341 cases 1–5 −22.99 … −22.98 LUFS, EBU 3342 LRA 10 / 5 / 20 / 15 LU |
 | GUI loudness maths (`t9_loudness.py`) on the machine's own blocks | EBU 3341 I: −22.99, −32.99, −23.01, −23.01, −22.98; EBU 3342 LRA: 10.0, 5.0, 20.0, 15.0 |
 | Sleep (`sleep_check.py`) | output exactly 0 while asleep; while awake identical to the always-running engine within 5e-4 raw units (−156 dBFS); wakes without a click |
-| CPU, steady state, 48 kHz in 256-sample blocks (`ns` per stereo sample; before → after the optimisations) | defaults ~380 → ~105 (0.5 % of one core); comp + EQ + 12 dB into the limiter ~390 → ~215; everything on ~390 → ~260 |
+| CPU, steady state, 48 kHz in 256-sample blocks (`ns` per stereo sample, best of 7 runs) | v1.0 port → v1.1: defaults ~380 → ~105; comp + EQ + 12 dB into the limiter ~390 → ~215. v1.1 → v1.2 with a full mastering setup (Low Cut, comp with sidechain HPF, Low Mono, limiter at −1.2 dBTP; meter windows closed): ~166 → ~108; the same limiting hard ~213 → ~133; defaults ~90 → ~40; with the parameter window open ~169 → ~146 |
 | Compile check against the ReBuzz `BuzzGUI.Interfaces` sources | clean (WPF from stand-ins: layout and look need a live check) |
 
 `./tests/run_all.sh <native-harness>` also runs the side-by-side check, given a harness built from
 the Buzz 1503 source (`tests/harness.cpp` there).
 
-## Verify in ReBuzz (v1.0.0)
+## Verify in ReBuzz (v1.2.0)
 
 1. **Loads:** *Pedal Master N* appears under Effects after a restart of ReBuzz; the Debug Console
    (Ctrl+D) shows no load exception.

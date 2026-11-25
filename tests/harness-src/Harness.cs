@@ -33,6 +33,7 @@ static class Program
         }
         var sleeper = new SilenceSleep();
         var f = new MeterFrame();
+        e.ReadMeters(1, f);             // meters in use from the start, as with the GUI open
         var sb = new StringBuilder();
         int frames = x.Length / 2;
         int every = (int)(0.033 * sr / blk + 1);

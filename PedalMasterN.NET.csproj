@@ -38,7 +38,7 @@
     <Company>thepedal</Company>
     <Copyright>Copyright (c) 2026 thepedal. MIT License.</Copyright>
     <Product>Pedal Master N</Product>
-    <Version>1.0.0</Version>
+    <Version>1.2.0</Version>
   </PropertyGroup>
 
   <ItemGroup>

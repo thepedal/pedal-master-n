@@ -182,6 +182,186 @@ namespace PedalMasterN
         public void Run2(ref double l, ref double r) { Step(); l = TickL(l); r = TickR(r); } // stereo pair
     }
 
+    // ── Two-lane (stereo) versions ────────────────────────────────────────────
+    // The same filters with left and right in the two lanes of a Vector128<double>:
+    // one instruction does both channels. Every lane performs exactly the scalar
+    // operations in the same order (no FMA), so the results are bit-identical to
+    // the scalar classes above. SvfV can also give each lane its own design
+    // (Low Mono runs the mid all-pass and the side high-pass side by side).
+
+    internal sealed class BiquadV
+    {
+        Vector128<double> b0 = Vector128.Create(1.0), b1, b2, a1, a2;
+        Vector128<double> z1, z2;
+
+        public void Reset() { z1 = z2 = Vector128<double>.Zero; }
+
+        void Set(Biquad q)
+        {
+            b0 = Vector128.Create(q.b0); b1 = Vector128.Create(q.b1); b2 = Vector128.Create(q.b2);
+            a1 = Vector128.Create(q.a1); a2 = Vector128.Create(q.a2);
+        }
+        public void HighPass(double fs, double f, double qf) { var q = new Biquad(); q.HighPass(fs, f, qf); Set(q); }
+        public void KShelf(double rate)    { var q = new Biquad(); q.KShelf(rate); Set(q); }
+        public void KHighPass(double rate) { var q = new Biquad(); q.KHighPass(rate); Set(q); }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public Vector128<double> Run(Vector128<double> x)
+        {
+            var y = b0 * x + z1;
+            z1 = b1 * x - a1 * y + z2;
+            z2 = b2 * x - a2 * y;
+            return y;
+        }
+    }
+
+    // Four lanes: the K-weighting of the dry input (L, R) and of the master (L, R)
+    // share their coefficients, so both run as one filter.
+    internal sealed class BiquadV4
+    {
+        Vector256<double> b0 = Vector256.Create(1.0), b1, b2, a1, a2;
+        Vector256<double> z1, z2;
+
+        public void Reset() { z1 = z2 = Vector256<double>.Zero; }
+
+        void Set(Biquad q)
+        {
+            b0 = Vector256.Create(q.b0); b1 = Vector256.Create(q.b1); b2 = Vector256.Create(q.b2);
+            a1 = Vector256.Create(q.a1); a2 = Vector256.Create(q.a2);
+        }
+        public void KShelf(double rate)    { var q = new Biquad(); q.KShelf(rate); Set(q); }
+        public void KHighPass(double rate) { var q = new Biquad(); q.KHighPass(rate); Set(q); }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public Vector256<double> Run(Vector256<double> x)
+        {
+            var y = b0 * x + z1;
+            z1 = b1 * x - a1 * y + z2;
+            z2 = b2 * x - a2 * y;
+            return y;
+        }
+    }
+
+    internal sealed class SvfV
+    {
+        static readonly Vector128<double> Two = Vector128.Create(2.0);
+        Vector128<double> c0 = Vector128.Create(1.0), c1, c2, c3 = Vector128.Create(1.0), c4, c5;
+        Vector128<double> t0 = Vector128.Create(1.0), t1, t2, t3 = Vector128.Create(1.0), t4, t5;
+        Vector128<double> d0, d1, d2, d3, d4, d5;
+        int left;
+        Vector128<double> ic1, ic2;
+
+        public void Reset() { ic1 = ic2 = Vector128<double>.Zero; }
+
+        public bool IsUnity => left == 0 && Vector128.EqualsAll(c3, Vector128.Create(1.0))
+                               && Vector128.EqualsAll(c4, Vector128<double>.Zero) && Vector128.EqualsAll(c5, Vector128<double>.Zero);
+
+        static Vector128<double> Put(Vector128<double> v, int lane, double x) => lane < 0 ? Vector128.Create(x) : v.WithElement(lane, x);
+
+        // lane = -1: both channels; 0 or 1: that lane only.
+        void Core(int lane, double g, double k, double m0, double m1, double m2)
+        {
+            double a1 = 1.0 / (1.0 + g * (g + k));
+            t0 = Put(t0, lane, a1); t1 = Put(t1, lane, g * a1); t2 = Put(t2, lane, g * g * a1);
+            t3 = Put(t3, lane, m0); t4 = Put(t4, lane, m1); t5 = Put(t5, lane, m2);
+        }
+
+        public void LowPass(double fs, double f, double q, int lane = -1)  { Core(lane, Math.Tan(Math.PI * f / fs), 1 / q, 0, 0, 1); }
+        public void HighPass(double fs, double f, double q, int lane = -1) { double k = 1 / q; Core(lane, Math.Tan(Math.PI * f / fs), k, 1, -k, -1); }
+        // 2nd-order all-pass: LP + HP of a Butterworth pair squared (an LR4 crossover's sum).
+        public void AllPass(double fs, double f, double q, int lane = -1)  { double k = 1 / q; Core(lane, Math.Tan(Math.PI * f / fs), k, 1, -2 * k, 0); }
+        // Output = input, exactly (a lane that only passes through).
+        public void Through(double fs, double f, double q, int lane = -1)  { Core(lane, Math.Tan(Math.PI * f / fs), 1 / q, 1, 0, 0); }
+
+        public void LowShelf(double fs, double f, double db, double k)
+        {
+            double A = Math.Pow(10.0, db / 40.0);
+            Core(-1, Math.Tan(Math.PI * f / fs) / Math.Sqrt(A), k, 1, k * (A - 1), A * A - 1);
+        }
+        public void Bell(double fs, double f, double db, double q)
+        {
+            double A = Math.Pow(10.0, db / 40.0), k = 1.0 / (q * A);
+            Core(-1, Math.Tan(Math.PI * f / fs), k, 1, k * (A * A - 1), 0);
+        }
+        public void HighShelf(double fs, double f, double db)
+        {
+            double A = Math.Pow(10.0, db / 40.0), k = Math.Sqrt(2.0);
+            Core(-1, Math.Tan(Math.PI * f / fs) * Math.Sqrt(A), k, A * A, k * (1 - A) * A, 1 - A * A);
+        }
+
+        public void Apply(int n)
+        {
+            if (n <= 0)
+            {
+                c0 = t0; c1 = t1; c2 = t2; c3 = t3; c4 = t4; c5 = t5;
+                d0 = d1 = d2 = d3 = d4 = d5 = Vector128<double>.Zero;
+                left = 0;
+                return;
+            }
+            var inv = Vector128.Create((double)n);
+            d0 = (t0 - c0) / inv; d1 = (t1 - c1) / inv; d2 = (t2 - c2) / inv;
+            d3 = (t3 - c3) / inv; d4 = (t4 - c4) / inv; d5 = (t5 - c5) / inv;
+            left = n;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public Vector128<double> Run(Vector128<double> v0)
+        {
+            if (left > 0)
+            {
+                if (--left == 0) { c0 = t0; c1 = t1; c2 = t2; c3 = t3; c4 = t4; c5 = t5; }
+                else { c0 += d0; c1 += d1; c2 += d2; c3 += d3; c4 += d4; c5 += d5; }
+            }
+            var v3 = v0 - ic2;
+            var v1 = c0 * ic1 + c1 * v3;
+            var v2 = ic2 + c1 * ic1 + c2 * v3;
+            ic1 = Two * v1 - ic1;
+            ic2 = Two * v2 - ic2;
+            return c3 * v0 + c4 * v1 + c5 * v2;
+        }
+    }
+
+    internal sealed class Tilt1V
+    {
+        Vector128<double> G, mH = Vector128.Create(1.0), mL = Vector128.Create(1.0);
+        double tG, tH = 1, tL = 1, cG, cH = 1, cL = 1, dG, dH, dL;
+        int left;
+        Vector128<double> s;
+
+        public void Reset() { s = Vector128<double>.Zero; }
+
+        public void Design(double fs, double f0, double db)
+        {
+            double A = Math.Pow(10.0, db / 40.0);
+            double g = A * Math.Tan(Math.PI * f0 / fs);
+            tG = g / (1.0 + g); tH = A; tL = 1.0 / A;
+        }
+
+        public void Apply(int n)
+        {
+            if (n <= 0) { cG = tG; cH = tH; cL = tL; left = 0; Load(); return; }
+            dG = (tG - cG) / n; dH = (tH - cH) / n; dL = (tL - cL) / n;
+            left = n;
+        }
+
+        void Load() { G = Vector128.Create(cG); mH = Vector128.Create(cH); mL = Vector128.Create(cL); }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public Vector128<double> Run(Vector128<double> x)
+        {
+            if (left > 0)
+            {
+                if (--left == 0) { cG = tG; cH = tH; cL = tL; }
+                else { cG += dG; cH += dH; cL += dL; }
+                Load();
+            }
+            var v = (x - s) * G;
+            var lp = v + s;
+            s = lp + v;
+            return mH * (x - lp) + mL * lp;
+        }
+    }
+
     // ── First-order tilt (trapezoidal one-pole, per-sample coefficient ramps) ──
     // Same response as the bilinear design H(s) = (A·s + w0) / (s + A·w0) prewarped
     // at f0 (gain 1/A below, A above, exactly 0 dB at f0), written as
@@ -313,6 +493,16 @@ namespace PedalMasterN
 
             TpBound  = Transpose(TpRev,  TpT,  TP_TAPS,  TP_PHASES,  TP_TAPS / 2);
             DetBound = Transpose(DetRev, DetT, DET_TAPS, DET_PHASES, DET_HALF);
+            DetFarBound = FarBound();
+            double tw = 0;
+            for (int ph = 1; ph < TP_PHASES; ph++)
+            {
+                double far = 0;
+                for (int k = 0; k < TP_TAPS; k++)
+                    if (k < TP_NEAR_LO || k >= TP_NEAR_HI) far += Math.Abs(TpT[k * TP_PHASES + ph]);
+                if (far > tw) tw = far;
+            }
+            TpFarBound = (float)(tw * 1.0001);
         }
 
         static float Transpose(float[] rev, float[] tr, int taps, int phases, int H)
@@ -345,6 +535,12 @@ namespace PedalMasterN
         public static float MaxAbs(float[] a, int off, int taps)
         {
             ref float p = ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(a), off);
+            if ((taps & 7) == 0 && Vector256.IsHardwareAccelerated)
+            {
+                Vector256<float> w = Vector256.Abs(Vector256.LoadUnsafe(ref p));
+                for (int k = 8; k < taps; k += 8) w = Vector256.Max(w, Vector256.Abs(Vector256.LoadUnsafe(ref p, (nuint)k)));
+                return HMax(Vector128.Max(w.GetLower(), w.GetUpper()));
+            }
             Vector128<float> m = Vector128.Abs(Vector128.LoadUnsafe(ref p));
             for (int k = 4; k < taps; k += 4) m = Vector128.Max(m, Vector128.Abs(Vector128.LoadUnsafe(ref p, (nuint)k)));
             return HMax(m);
@@ -386,6 +582,113 @@ namespace PedalMasterN
                 pkL = HMax(Vector128.Max(Vector128.Abs(l0), Vector128.Abs(l1)));
                 pkR = HMax(Vector128.Max(Vector128.Abs(r0), Vector128.Abs(r1)));
             }
+        }
+
+        // Tiered limiter detector. The plain bound (window max × DetBound, +7.6 dB)
+        // is too loose for a loud master, so before the full search: the 16 central
+        // taps exactly, for all phases and both channels, plus the rest bounded by
+        // DetFarBound × the window max (0.061 of it). If that stays below the
+        // ceiling the attenuation is exactly 1 and the bound is returned; otherwise
+        // the outer 16 taps are added to the same sums for the exact peak.
+        public const int NEAR_LO = 8, NEAR_HI = 24;            // taps [8, 24) are "near"
+        public static readonly float DetFarBound;              // set in the static constructor, after DetT
+        public const int TP_NEAR_LO = 3, TP_NEAR_HI = 9;       // meter: taps [3, 9) are "near"
+        public static readonly float TpFarBound;
+
+        static float FarBound()
+        {
+            double worst = 0;
+            for (int ph = 1; ph < DET_PHASES; ph++)
+            {
+                double far = 0;
+                for (int k = 0; k < DET_TAPS; k++)
+                    if (k < NEAR_LO || k >= NEAR_HI) far += Math.Abs(DetT[k * DET_PHASES + ph]);
+                if (far > worst) worst = far;
+            }
+            return (float)(worst * 1.0001);
+        }
+
+        public static float DetPeakTiered(float[] l, float[] r, int off, float ceil, float windowMax)
+        {
+            ref float wl = ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(l), off);
+            ref float wr = ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(r), off);
+            ref float t = ref MemoryMarshal.GetArrayDataReference(DetT);
+            if (Vector256.IsHardwareAccelerated)
+            {
+                Vector256<float> aL0 = Vector256<float>.Zero, aL1 = aL0, aR0 = aL0, aR1 = aL0;
+                for (int k = NEAR_LO; k < NEAR_HI; k += 2)
+                {
+                    var c0 = Vector256.LoadUnsafe(ref t, (nuint)(k * 8));
+                    var c1 = Vector256.LoadUnsafe(ref t, (nuint)(k * 8 + 8));
+                    aL0 += Vector256.Create(Unsafe.Add(ref wl, k)) * c0;
+                    aR0 += Vector256.Create(Unsafe.Add(ref wr, k)) * c0;
+                    aL1 += Vector256.Create(Unsafe.Add(ref wl, k + 1)) * c1;
+                    aR1 += Vector256.Create(Unsafe.Add(ref wr, k + 1)) * c1;
+                }
+                var m = Vector256.Max(Vector256.Abs(aL0 + aL1), Vector256.Abs(aR0 + aR1));
+                float near = HMax(Vector128.Max(m.GetLower(), m.GetUpper()));
+                float bound = (near + DetFarBound * windowMax) * 1.00001f;
+                if (bound < ceil) return bound;
+                for (int k = 0; k < DET_TAPS; k += 2)
+                {
+                    if (k == NEAR_LO) k = NEAR_HI;
+                    var c0 = Vector256.LoadUnsafe(ref t, (nuint)(k * 8));
+                    var c1 = Vector256.LoadUnsafe(ref t, (nuint)(k * 8 + 8));
+                    aL0 += Vector256.Create(Unsafe.Add(ref wl, k)) * c0;
+                    aR0 += Vector256.Create(Unsafe.Add(ref wr, k)) * c0;
+                    aL1 += Vector256.Create(Unsafe.Add(ref wl, k + 1)) * c1;
+                    aR1 += Vector256.Create(Unsafe.Add(ref wr, k + 1)) * c1;
+                }
+                m = Vector256.Max(Vector256.Abs(aL0 + aL1), Vector256.Abs(aR0 + aR1));
+                return HMax(Vector128.Max(m.GetLower(), m.GetUpper()));
+            }
+            else
+            {
+                Vector128<float> l0 = Vector128<float>.Zero, l1 = l0, r0 = l0, r1 = l0;
+                for (int k = NEAR_LO; k < NEAR_HI; k++)
+                {
+                    var c0 = Vector128.LoadUnsafe(ref t, (nuint)(k * 8));
+                    var c1 = Vector128.LoadUnsafe(ref t, (nuint)(k * 8 + 4));
+                    var xl = Vector128.Create(Unsafe.Add(ref wl, k)); var xr = Vector128.Create(Unsafe.Add(ref wr, k));
+                    l0 += xl * c0; l1 += xl * c1; r0 += xr * c0; r1 += xr * c1;
+                }
+                float near = HMax(Vector128.Max(Vector128.Max(Vector128.Abs(l0), Vector128.Abs(l1)),
+                                                Vector128.Max(Vector128.Abs(r0), Vector128.Abs(r1))));
+                float bound = (near + DetFarBound * windowMax) * 1.00001f;
+                if (bound < ceil) return bound;
+                for (int k = 0; k < DET_TAPS; k++)
+                {
+                    if (k == NEAR_LO) k = NEAR_HI;
+                    var c0 = Vector128.LoadUnsafe(ref t, (nuint)(k * 8));
+                    var c1 = Vector128.LoadUnsafe(ref t, (nuint)(k * 8 + 4));
+                    var xl = Vector128.Create(Unsafe.Add(ref wl, k)); var xr = Vector128.Create(Unsafe.Add(ref wr, k));
+                    l0 += xl * c0; l1 += xl * c1; r0 += xr * c0; r1 += xr * c1;
+                }
+                return HMax(Vector128.Max(Vector128.Max(Vector128.Abs(l0), Vector128.Abs(l1)),
+                                          Vector128.Max(Vector128.Abs(r0), Vector128.Abs(r1))));
+            }
+        }
+
+        // True-peak meter, tiered like the detector: the 6 central taps exactly, the
+        // rest bounded by TpFarBound × the window max (0.05 of it). Returns the
+        // window's true peak if it can exceed `floor`, else 0 (no new peak).
+        public static float TpPeakTiered(float[] h, int off, float floor, float windowMax)
+        {
+            ref float w = ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(h), off);
+            ref float t = ref MemoryMarshal.GetArrayDataReference(TpT);
+            Vector128<float> a0 = Vector128<float>.Zero, a1 = a0;
+            for (int k = TP_NEAR_LO; k < TP_NEAR_HI; k += 2)
+            {
+                a0 += Vector128.Create(Unsafe.Add(ref w, k)) * Vector128.LoadUnsafe(ref t, (nuint)(k * 4));
+                a1 += Vector128.Create(Unsafe.Add(ref w, k + 1)) * Vector128.LoadUnsafe(ref t, (nuint)(k * 4 + 4));
+            }
+            float near = HMax(Vector128.Abs(a0 + a1));
+            if ((near + TpFarBound * windowMax) * 1.00001f <= floor) return 0.0f;
+            for (int k = 0; k < TP_NEAR_LO; k++)                        // the outer taps
+                a0 += Vector128.Create(Unsafe.Add(ref w, k)) * Vector128.LoadUnsafe(ref t, (nuint)(k * 4));
+            for (int k = TP_NEAR_HI; k < TP_TAPS; k++)
+                a1 += Vector128.Create(Unsafe.Add(ref w, k)) * Vector128.LoadUnsafe(ref t, (nuint)(k * 4));
+            return HMax(Vector128.Abs(a0 + a1));
         }
 
         // True-peak meter: the peak over the 4 phases of one channel's window.
